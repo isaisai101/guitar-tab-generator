@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+uploads/*
+outputs/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+.env
+*.egg-info/
+dist/
+build/
+.DS_Store

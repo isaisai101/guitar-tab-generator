@@ -1,0 +1,297 @@
+:root {
+  --bg: #0f0f13;
+  --surface: #1a1a24;
+  --surface2: #23232f;
+  --border: #2e2e3e;
+  --accent: #7c3aed;
+  --accent-light: #a78bfa;
+  --accent-glow: rgba(124, 58, 237, 0.35);
+  --green: #22c55e;
+  --red: #ef4444;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --tab-font: 'Courier New', Courier, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  min-height: 100vh;
+  padding: 2rem 1rem 4rem;
+}
+
+.app {
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+/* ── Header ── */
+header {
+  text-align: center;
+  margin-bottom: 2.5rem;
+}
+header h1 {
+  font-size: 2.2rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, #a78bfa, #7c3aed);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  letter-spacing: -0.5px;
+}
+.subtitle {
+  color: var(--muted);
+  margin-top: 0.4rem;
+  font-size: 0.95rem;
+}
+
+/* ── Cards ── */
+.input-card, .progress-card, .result-card, .error-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 2rem;
+  margin-bottom: 1.5rem;
+}
+
+/* ── Tab switcher ── */
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  background: var(--bg);
+  border-radius: 10px;
+  padding: 4px;
+  width: fit-content;
+}
+.tab-btn {
+  background: none;
+  border: none;
+  color: var(--muted);
+  padding: 0.45rem 1.1rem;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: all 0.18s;
+}
+.tab-btn.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.tab-btn:not(.active):hover {
+  color: var(--text);
+  background: var(--surface2);
+}
+
+/* ── Dropzone ── */
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+}
+.dropzone:hover, .dropzone.drag-over {
+  border-color: var(--accent);
+  background: rgba(124, 58, 237, 0.07);
+}
+.dropzone svg {
+  width: 40px; height: 40px;
+  color: var(--accent-light);
+  margin-bottom: 0.3rem;
+}
+.dropzone p { font-size: 1rem; color: var(--text); }
+.dropzone span { font-size: 0.8rem; color: var(--muted); }
+
+/* ── URL input ── */
+.url-input-wrap {
+  display: flex;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+.url-input-wrap input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 0.65rem 1rem;
+  color: var(--text);
+  font-size: 0.95rem;
+  outline: none;
+  transition: border-color 0.18s;
+}
+.url-input-wrap input:focus { border-color: var(--accent); }
+.hint { font-size: 0.8rem; color: var(--muted); }
+
+/* ── Buttons ── */
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 0.65rem 1.4rem;
+  border-radius: 9px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.18s, box-shadow 0.18s;
+  white-space: nowrap;
+}
+.btn-primary:hover { opacity: 0.85; box-shadow: 0 0 14px var(--accent-glow); }
+
+.btn-secondary {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 0.6rem 1.2rem;
+  border-radius: 9px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background 0.18s;
+}
+.btn-secondary:hover { background: var(--border); }
+
+/* ── Progress ── */
+.progress-card {
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+.spinner {
+  width: 44px; height: 44px;
+  border: 4px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.progress-msg { color: var(--muted); font-size: 0.95rem; }
+.progress-bar-track {
+  width: 100%;
+  max-width: 420px;
+  height: 8px;
+  background: var(--bg);
+  border-radius: 99px;
+  overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-light));
+  border-radius: 99px;
+  transition: width 0.4s ease;
+}
+.progress-pct { font-size: 0.85rem; color: var(--muted); }
+
+/* ── Result ── */
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+.result-header h2 { font-size: 1.3rem; margin-bottom: 0.3rem; }
+.tuning-badge {
+  display: inline-block;
+  background: rgba(124,58,237,0.18);
+  color: var(--accent-light);
+  border: 1px solid rgba(124,58,237,0.35);
+  border-radius: 20px;
+  padding: 0.2rem 0.85rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+/* ── Tab viewer ── */
+.tab-viewer {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.2rem 1.4rem;
+  overflow-x: auto;
+  margin-bottom: 1.5rem;
+}
+#tabPre {
+  font-family: var(--tab-font);
+  font-size: 0.88rem;
+  line-height: 1.7;
+  color: #c8f5a0;
+  white-space: pre;
+}
+
+/* ── Visual tab (fretboard columns) ── */
+.visual-tab {
+  margin-bottom: 1.5rem;
+}
+.visual-tab h3 {
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin-bottom: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.vt-lines {
+  overflow-x: auto;
+  padding-bottom: 0.5rem;
+}
+.vt-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  font-family: var(--tab-font);
+  font-size: 0.85rem;
+  line-height: 1.9;
+}
+.vt-label {
+  width: 24px;
+  color: var(--accent-light);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.vt-line {
+  display: flex;
+}
+.vt-cell {
+  width: 36px;
+  text-align: center;
+  border-bottom: 1px solid #3a3a50;
+  color: #e2e8f0;
+  position: relative;
+}
+.vt-cell.has-note {
+  color: #7c3aed;
+  font-weight: 700;
+}
+.vt-cell.has-note::after {
+  content: '';
+  position: absolute;
+  bottom: -1px; left: 50%;
+  transform: translateX(-50%);
+  width: 28px; height: 2px;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.reset-btn { margin-top: 0.5rem; }
+
+/* ── Error ── */
+.error-card {
+  border-color: rgba(239,68,68,0.4);
+  background: rgba(239,68,68,0.07);
+}
+.error-card h3 { color: var(--red); margin-bottom: 0.5rem; }
+.error-card p { color: var(--muted); margin-bottom: 1rem; font-size: 0.9rem; }
+
+.hidden { display: none !important; }
