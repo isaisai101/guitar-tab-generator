@@ -360,18 +360,11 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    """Polyphonic guitar transcription using log-HPS + onset detection.
+    """Polyphonic guitar transcription: additive salience + onset detection.
 
-    WHY log-HPS instead of additive salience:
-    Additive salience: sal[b] = C[b] + 0.5*C[b+12] + ...
-      → Playing E4 adds 0.25*C[E4] to bin E2, creating a GHOST E2 note.
-      → Open E detected as a chord containing E2, E3, E4 (wrong).
-
-    Log-HPS: log_hps[b] = log C[b] + log C[b+12] + log C[b+19] + log C[b+24]
-      → If C[b] ≈ 0 (no note there), log C[b] is very negative → hps[b] ≈ 0
-        regardless of what harmonics are present.
-      → Only GENUINE fundamentals (where the bin itself has energy) score high.
-      → Open E4 no longer creates a false E2 detection.
+    Additive salience lifts genuine fundamentals above their harmonics.
+    Sub-harmonic ghost suppression in is_harmonic() stops "open E4" from
+    creating false detections at E2/E3 (which share E4 as a harmonic).
     """
     import librosa
     import numpy as np
@@ -380,27 +373,26 @@ def run_basic_pitch(job_id, wav_path: Path):
     y, sr = librosa.load(str(wav_path), mono=True, duration=90.0)
     hop = 512
 
-    fmin = librosa.note_to_hz("D2")   # 73.4 Hz, MIDI 38 — covers Drop D
+    fmin = librosa.note_to_hz("D2")   # 73.4 Hz — MIDI 38, covers Drop D
     FMIN_MIDI = 38
     n_bins = 62
     C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop,
                              fmin=fmin, n_bins=n_bins, bins_per_octave=12))
 
-    # ── Log Harmonic Product Spectrum ────────────────────────────────────────
-    # hps[b] ∝ C[b] × C[b+12] × C[b+19] × C[b+24]  (computed in log space)
-    # 12 bins = 2nd harmonic (octave), 19 = 3rd, 24 = 4th (two octaves)
-    eps = max(float(np.percentile(C, 5)), 1e-9)
-    log_C   = np.log(C.astype(np.float32) + eps)
-    log_hps = log_C.copy()
-    for off in [12, 19, 24]:
+    # ── Additive harmonic salience ────────────────────────────────────────────
+    # sal[b] = C[b] + 0.5·C[b+12] + 0.33·C[b+19] + 0.25·C[b+24]
+    # Bins 12, 19, 24 are the 2nd, 3rd, 4th harmonics in 12-tone CQT.
+    # Genuine fundamentals accumulate energy from their harmonics → high sal.
+    # Random overtones lack their OWN harmonics → low sal.
+    sal = C.astype(np.float32).copy()
+    for off, w in [(12, 0.50), (19, 0.33), (24, 0.25)]:
         if off < n_bins:
-            log_hps[:n_bins - off, :] += log_C[off:, :]
-    hps = np.exp(log_hps - log_hps.max())  # normalise; relative values are what matter
+            sal[:n_bins - off, :] += w * C[off:, :]
 
-    hps_noise = float(np.percentile(hps, 60))
-    hps_max   = float(hps.max())
+    # Noise floor: 40th percentile of salience across the whole stem.
+    noise = float(np.percentile(sal, 40))
 
-    # ── Onset detection on raw CQT (more responsive than HPS for transients) ─
+    # ── Onset detection on raw CQT ────────────────────────────────────────────
     onset_env = librosa.onset.onset_strength(
         S=librosa.amplitude_to_db(C, ref=np.max),
         sr=sr, hop_length=hop,
@@ -409,7 +401,7 @@ def run_basic_pitch(job_id, wav_path: Path):
         onset_envelope=onset_env, sr=sr, hop_length=hop,
         backtrack=True, units="frames",
         pre_max=3, post_max=3, pre_avg=7, post_avg=7,
-        delta=0.40, wait=8,
+        delta=0.35, wait=8,
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
@@ -419,45 +411,47 @@ def run_basic_pitch(job_id, wav_path: Path):
     notes = []
 
     for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
-        win_end = min(frame + 10, hps.shape[1])
-        if frame >= hps.shape[1]:
+        win_end = min(frame + 8, sal.shape[1])
+        if frame >= sal.shape[1]:
             continue
 
-        mag = hps[:, frame:win_end].mean(axis=1)
+        mag = sal[:, frame:win_end].mean(axis=1)   # average salience over 8 frames
         peak_mag = float(mag.max())
 
-        if peak_mag < max(hps_noise * 6.0, hps_max * 0.04):
+        # Require signal at least 2.5× the noise floor to filter silent onsets
+        if peak_mag < noise * 2.5:
             continue
 
-        min_h = max(hps_noise * 3.0, peak_mag * 0.25)
+        # scipy find_peaks with prominence: only genuine spectral peaks survive
         peaks, _ = find_peaks(
             mag,
-            height=min_h,
+            height=max(noise * 1.2, peak_mag * 0.22),
             distance=2,
-            prominence=hps_noise * 1.5,
+            prominence=noise * 0.6,
         )
         if len(peaks) == 0:
             continue
 
-        # Limit to top-2: covers single notes and power chords (root+fifth).
-        # Taking more peaks from a noisy stem causes harmonic clutter.
+        # Top 2 candidates: single note or power chord (root + fifth)
         peaks = peaks[np.argsort(mag[peaks])[::-1][:2]]
 
+        # Harmonic suppression uses RAW CQT magnitudes (not salience).
+        # Suppresses:
+        #   a) b_test is an overtone of a kept bin (frequency ratio 2, 3, or 4)
+        #   b) b_test is a ghost sub-harmonic — it was only "found" because a
+        #      real note at b_kept is one of b_test's harmonics, and b_test
+        #      itself has very little raw energy.
         raw = C[:, frame:win_end].mean(axis=1)
 
-        def is_harmonic(b_hi, kept):
-            f_hi = fmin * 2 ** (b_hi / 12)
-            for b_lo in kept:
-                f_lo = fmin * 2 ** (b_lo / 12)
-                # b_hi is an overtone of b_lo (b_hi > b_lo)
+        def is_harmonic(b_test, kept):
+            f_t = fmin * 2 ** (b_test / 12)
+            for bk in kept:
+                f_k = fmin * 2 ** (bk / 12)
                 for h in [2, 3, 4]:
-                    if abs(f_hi / f_lo - h) < 0.09 and raw[b_lo] >= 0.28 * raw[b_hi]:
-                        return True
-                # b_hi is a ghost sub-harmonic: b_lo is actually one of b_hi's
-                # harmonics, and b_hi has very little raw energy of its own
-                for h in [2, 3, 4]:
-                    if abs(f_lo / f_hi - h) < 0.09 and raw[b_hi] < 0.35 * raw[b_lo]:
-                        return True
+                    if abs(f_t / f_k - h) < 0.09 and raw[bk] >= 0.25 * raw[b_test]:
+                        return True   # b_test is an overtone of bk
+                    if abs(f_k / f_t - h) < 0.09 and raw[b_test] < 0.45 * raw[bk]:
+                        return True   # b_test is a ghost (bk is b_test's harmonic)
             return False
 
         kept = []
