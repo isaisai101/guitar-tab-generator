@@ -360,55 +360,114 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    """Polyphonic pitch detection using Spotify's Basic Pitch neural network.
+    """Guitar pitch detection: pYIN (time-domain autocorrelation) + power-chord check.
 
-    Replaces the hand-rolled CQT+salience approach which could not handle:
-      - Distorted guitar: harmonic spreading fills every CQT bin uniformly,
-        making spectral peaks meaningless for fundamental detection.
-      - Fast note sequences: onset-gated peak-picking misses notes when two
-        onsets are too close for the filter to resolve them separately.
+    WHY pYIN instead of CQT salience or Basic Pitch:
 
-    Basic Pitch uses a CNN trained on real polyphonic audio and outputs
-    frame-level note probabilities directly, without needing manual thresholds.
-    Uses the ONNX backend (onnxruntime) — no TensorFlow required.
+    Distortion preserves the FUNDAMENTAL PERIOD of a note — it just adds
+    harmonics at integer multiples. pYIN finds periodicity in the time domain
+    (Cumulative Mean Normalized Difference Function) and is therefore robust
+    to any amount of distortion. CQT peak-picking and neural models trained on
+    clean audio both fail because they look at the frequency domain, where
+    distortion creates a flat wall of harmonic energy across all bins.
+
+    For a distorted E5 power chord (E2 + B2), the combined waveform has the
+    period of E2 (root), so pYIN correctly returns E2 even through a
+    WaveShaper-style guitar distortion.
+
+    After detecting the root via pYIN, we check whether the fifth (+7 semitones)
+    has significant CQT energy at the onset — if yes, it's a power chord and
+    we emit both notes. Single-note riffs only produce one note per onset.
     """
-    import warnings
-    import logging
-    warnings.filterwarnings("ignore")
-    logging.disable(logging.WARNING)
+    import librosa
+    import numpy as np
 
-    from basic_pitch.inference import predict
-    from basic_pitch import ICASSP_2022_MODEL_PATH
+    y, sr = librosa.load(str(wav_path), mono=True, duration=90.0)
+    hop = 512
 
-    # Guitar range: D2 (73.4 Hz, MIDI 38, covers Drop D) → E6 (1318.5 Hz)
-    _, _, note_events = predict(
-        str(wav_path),
-        ICASSP_2022_MODEL_PATH,
-        onset_threshold=0.5,
-        frame_threshold=0.3,
-        minimum_note_length=58,        # ms — filters sub-60ms glitches
-        minimum_frequency=73.4,        # D2
-        maximum_frequency=1318.5,      # E6
-        multiple_pitch_bends=False,
-        melodia_trick=True,
+    FMIN_HZ = librosa.note_to_hz("D2")   # 73.4 Hz — MIDI 38, covers Drop D
+    FMAX_HZ = librosa.note_to_hz("A5")   # 880 Hz — MIDI 81, covers high frets
+
+    # ── CQT — used only for onset detection and fifth-energy check ────────────
+    C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop,
+                            fmin=FMIN_HZ, n_bins=62, bins_per_octave=12))
+
+    onset_env = librosa.onset.onset_strength(
+        S=librosa.amplitude_to_db(C, ref=np.max), sr=sr, hop_length=hop,
+    )
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset_env, sr=sr, hop_length=hop,
+        backtrack=True, units="frames",
+        pre_max=3, post_max=3, pre_avg=7, post_avg=7,
+        delta=0.3, wait=6,
+    )
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
+
+    if len(onset_times) == 0:
+        return []
+
+    # ── pYIN — time-domain pitch over the full audio ─────────────────────────
+    # frame_length=2048 ≈ 46ms, gives pitch accuracy of ±0.5 semitones
+    f0_arr, voiced_flag, _ = librosa.pyin(
+        y,
+        fmin=FMIN_HZ,
+        fmax=FMAX_HZ,
+        sr=sr,
+        hop_length=hop,
+        frame_length=2048,
     )
 
     notes = []
-    for event in note_events:
-        start_t   = float(event[0])
-        end_t     = float(event[1])
-        pitch_midi = int(round(float(event[2])))
-        amplitude  = float(event[3]) if len(event) > 3 else 0.7
 
-        if not (38 <= pitch_midi <= 88):
+    for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
+        win_end = min(frame + 8, len(f0_arr))
+        if frame >= len(f0_arr):
             continue
 
+        # Take voiced pYIN pitch across 8 frames (~93 ms after onset)
+        f0_win     = f0_arr[frame:win_end]
+        voiced_win = voiced_flag[frame:win_end]
+        valid_f0   = f0_win[voiced_win & ~np.isnan(f0_win)]
+
+        if len(valid_f0) == 0:
+            continue
+
+        root_hz  = float(np.median(valid_f0))
+        root_midi = int(round(librosa.hz_to_midi(root_hz)))
+
+        if not (38 <= root_midi <= 81):
+            continue
+
+        dur = float(onset_times[i + 1] - onset_t) if i + 1 < len(onset_times) else 0.5
+        dur = max(min(dur, 2.0), 0.06)
+
         notes.append({
-            "start":    round(start_t, 3),
-            "end":      round(end_t,   3),
-            "pitch":    pitch_midi,
-            "velocity": int(min(127, max(40, amplitude * 127))),
+            "start":    round(float(onset_t), 3),
+            "end":      round(float(onset_t) + dur, 3),
+            "pitch":    root_midi,
+            "velocity": 80,
         })
+
+        # ── Power-chord fifth detection ────────────────────────────────────
+        # The fifth is root + 7 semitones (e.g. E2 + B2).
+        # B2 is NOT a harmonic of E2 (harmonics are 2x, 3x, … not 1.5x),
+        # so CQT energy at the fifth bin comes only from the fifth actually
+        # being played — not from the root's own harmonic series.
+        fifth_midi = root_midi + 7
+        if 38 <= fifth_midi <= 88:
+            root_bin  = int(round(12 * np.log2(root_hz / FMIN_HZ)))
+            fifth_bin = root_bin + 7
+            win_c     = min(frame + 8, C.shape[1])
+            if 0 <= root_bin < C.shape[0] and fifth_bin < C.shape[0]:
+                root_e  = float(C[root_bin,  frame:win_c].mean())
+                fifth_e = float(C[fifth_bin, frame:win_c].mean())
+                if root_e > 1e-8 and fifth_e / root_e > 0.30:
+                    notes.append({
+                        "start":    round(float(onset_t), 3),
+                        "end":      round(float(onset_t) + dur, 3),
+                        "pitch":    fifth_midi,
+                        "velocity": 72,
+                    })
 
     return notes
 
