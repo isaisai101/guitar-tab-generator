@@ -1,30 +1,31 @@
 @echo off
 echo ============================================================
-echo  Guitar Tab Generator - Setup (Windows + CUDA)
+echo  Guitar Tab Generator - Setup (Windows + CUDA / RTX 5000+)
 echo ============================================================
-
-where python >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python not found. Install Python 3.10+ from python.org
-    pause & exit /b 1
-)
 
 where ffmpeg >nul 2>&1
 if errorlevel 1 (
-    echo WARNING: ffmpeg not found.
-    echo   yt-dlp requires ffmpeg for audio extraction.
-    echo   Install via: winget install ffmpeg
-    echo   Or download from: https://ffmpeg.org/download.html
+    echo WARNING: ffmpeg not in PATH yet. You may need to restart this terminal.
+    echo   If yt-dlp fails, run:  winget install Gyan.FFmpeg
     echo.
 )
 
-echo Creating virtual environment...
-python -m venv venv
+echo Using Python 3.12 (required for PyTorch compatibility)...
+py -3.12 --version
+if errorlevel 1 (
+    echo ERROR: Python 3.12 not found.
+    echo   Install via:  winget install Python.Python.3.12
+    pause & exit /b 1
+)
+
+echo.
+echo Creating virtual environment with Python 3.12...
+py -3.12 -m venv venv
 call venv\Scripts\activate.bat
 
 echo.
-echo Installing PyTorch with CUDA 12.1 support...
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+echo Installing PyTorch with CUDA 12.8 support (RTX 5060 / Blackwell)...
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 echo.
 echo Installing remaining dependencies...

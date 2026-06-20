@@ -138,11 +138,11 @@ def process_audio(job_id, src: Path):
 
 def run_demucs(job_id, src: Path) -> Path:
     import torch
+    import sys
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_root = OUTPUT_DIR / job_id
     cmd = [
-        "python", "-m", "demucs",
-        "--two-stems", "other",   # isolates non-drum/bass/vocal — closest to guitar
+        sys.executable, "-m", "demucs",
         "-n", "htdemucs_6s",
         "--device", device,
         "-o", str(out_root),
@@ -196,20 +196,51 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    from basic_pitch.inference import predict
-    from basic_pitch import ICASSP_2022_MODEL_PATH
+    """Transcribe notes using librosa's probabilistic YIN (pyin) pitch tracker."""
+    import librosa
     import numpy as np
 
-    model_output, midi_data, note_events = predict(str(wav_path))
+    y, sr = librosa.load(str(wav_path), mono=True)
 
+    # pyin gives confident per-frame fundamental frequency estimates
+    hop = 512
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y, sr=sr,
+        fmin=librosa.note_to_hz("E2"),   # lowest open guitar string
+        fmax=librosa.note_to_hz("E6"),   # highest practical fret
+        hop_length=hop,
+    )
+
+    times = librosa.times_like(f0, sr=sr, hop_length=hop)
     notes = []
-    for note in midi_data.instruments[0].notes if midi_data.instruments else []:
-        notes.append({
-            "start": round(note.start, 3),
-            "end":   round(note.end, 3),
-            "pitch": int(note.pitch),
-            "velocity": int(note.velocity),
-        })
+    in_note = False
+    note_start = 0.0
+    note_midi = 0
+
+    for i, (t, freq, voiced) in enumerate(zip(times, f0, voiced_flag)):
+        if voiced and freq is not None and not np.isnan(freq):
+            midi = int(round(librosa.hz_to_midi(freq)))
+            midi = max(40, min(88, midi))  # clamp to guitar range
+            if not in_note:
+                in_note = True
+                note_start = float(t)
+                note_midi = midi
+            elif midi != note_midi:
+                # pitch changed — close old note, open new one
+                duration = float(t) - note_start
+                if duration >= 0.05:
+                    notes.append({"start": round(note_start, 3), "end": round(float(t), 3),
+                                  "pitch": note_midi, "velocity": 80})
+                note_start = float(t)
+                note_midi = midi
+        else:
+            if in_note:
+                duration = float(t) - note_start
+                if duration >= 0.05:
+                    notes.append({"start": round(note_start, 3), "end": round(float(t), 3),
+                                  "pitch": note_midi, "velocity": 80})
+                in_note = False
+
     return notes
 
 

@@ -1,13 +1,9 @@
 flask==3.0.3
 flask-cors==4.0.1
 demucs==4.0.1
-basic-pitch==0.3.3
 librosa==0.10.2
 numpy==1.26.4
 scipy==1.13.1
-yt-dlp==2024.5.27
-torch>=2.1.0
-torchaudio>=2.1.0
-pretty-midi==0.2.10
+yt-dlp
 soundfile==0.12.1
 werkzeug==3.0.3
