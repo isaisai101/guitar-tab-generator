@@ -109,21 +109,22 @@ def process_youtube(job_id, url):
             url
         ]
         subprocess.run(cmd, check=True, capture_output=True)
-        # find the downloaded file
         matches = list(UPLOAD_DIR.glob(f"{job_id}.*"))
         if not matches:
             raise RuntimeError("yt-dlp produced no output file")
         src = matches[0]
         process_audio(job_id, src)
-    except Exception as e:
-        set_job(job_id, status="error", message=str(e))
+    except BaseException as e:
+        # BaseException (not just Exception) catches SystemExit from yt-dlp/argparse
+        set_job(job_id, status="error", message=str(e) or type(e).__name__)
         traceback.print_exc()
 
 
 def process_audio(job_id, src: Path):
     try:
-        # 1) Separate stems with Demucs
-        set_job(job_id, status="running", progress=10, message="Separating guitar track with Demucs…")
+        # 1) Separate stems with Demucs (GPU inference — typically 1-3 min)
+        set_job(job_id, status="running", progress=10,
+                message="Separating guitar track with Demucs (GPU inference — this takes 1–3 min)…")
         guitar_wav = run_demucs(job_id, src)
 
         # 2) Detect tuning
@@ -159,8 +160,10 @@ def process_audio(job_id, src: Path):
                 "overdrive": overdrive_info,
             }
         )
-    except Exception as e:
-        set_job(job_id, status="error", message=str(e))
+    except BaseException as e:
+        # BaseException catches SystemExit (raised by demucs/argparse on failure),
+        # which plain `except Exception` silently misses, leaving the job stuck "running".
+        set_job(job_id, status="error", message=str(e) or type(e).__name__)
         traceback.print_exc()
 
 
@@ -171,13 +174,30 @@ def run_demucs(job_id, src: Path) -> Path:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_root = OUTPUT_DIR / job_id
 
-    # Run in-process so the torchaudio.save patch above is in effect
-    demucs_main([
-        "-n", "htdemucs_6s",
-        "--device", device,
-        "-o", str(out_root),
-        str(src),
-    ])
+    # Slowly advance progress bar (10 → 45 %) while Demucs runs on the GPU.
+    # This gives the user visual feedback during what can be a 1-3 min wait.
+    _stop = threading.Event()
+
+    def _ticker():
+        pct = 10
+        while not _stop.wait(6):   # fires every 6 s
+            pct = min(pct + 3, 45)
+            set_job(job_id, progress=pct,
+                    message=f"Separating guitar track with Demucs on {device.upper()}…")
+
+    t = threading.Thread(target=_ticker, daemon=True)
+    t.start()
+
+    try:
+        # Run in-process so the torchaudio.save patch above is in effect
+        demucs_main([
+            "-n", "htdemucs_6s",
+            "--device", device,
+            "-o", str(out_root),
+            str(src),
+        ])
+    finally:
+        _stop.set()
 
     # htdemucs_6s produces: drums, bass, guitar, piano, vocals, other
     stem_root = out_root / "htdemucs_6s" / src.stem
@@ -472,4 +492,6 @@ def _render_tab_text(columns, string_labels, tuning_name):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    # use_reloader=False: Werkzeug's reloader would restart the process mid-job,
+    # wiping the in-memory jobs dict and killing background threads.
+    app.run(debug=True, port=5000, use_reloader=False)
