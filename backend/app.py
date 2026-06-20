@@ -98,13 +98,26 @@ def download(job_id):
 
 # ── Processing pipeline ───────────────────────────────────────────────────────
 
+def _clean_yt_url(url: str) -> str:
+    """Strip playlist/radio params so yt-dlp downloads only the single video."""
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    # Keep only the video ID; drop list, start_radio, index, etc.
+    clean_qs = {k: v for k, v in qs.items() if k == "v"}
+    new_query = urlencode(clean_qs, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
 def process_youtube(job_id, url):
     try:
+        url = _clean_yt_url(url)
         set_job(job_id, status="running", progress=5, message="Downloading from YouTube…")
         out_path = UPLOAD_DIR / f"{job_id}.%(ext)s"
         cmd = [
             "yt-dlp", "-x", "--audio-format", "wav",
             "--audio-quality", "0",
+            "--no-playlist",
             "-o", str(out_path),
             url
         ]
@@ -120,26 +133,54 @@ def process_youtube(job_id, url):
         traceback.print_exc()
 
 
+def _crop_to_90s(src: Path) -> Path:
+    """Use ffmpeg to crop the input to 90 s before Demucs.
+
+    Demucs on a 4-minute song takes 2-3 minutes even on GPU. 90 seconds covers
+    the intro + first verse (most of what the user cares about) and keeps
+    Demucs time to ~30-45 seconds.  Falls back to the original file if ffmpeg
+    isn't in PATH or the file is already short.
+    """
+    out = UPLOAD_DIR / f"{src.stem}_90s.wav"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             "-t", "90",
+             "-acodec", "pcm_s16le", "-ar", "44100",
+             str(out)],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return out
+    except Exception:
+        pass
+    return src  # ffmpeg unavailable or failed — use full file
+
+
 def process_audio(job_id, src: Path):
     try:
-        # 1) Separate stems with Demucs (GPU inference — typically 1-3 min)
-        set_job(job_id, status="running", progress=10,
-                message="Separating guitar track with Demucs (GPU inference — this takes 1–3 min)…")
-        guitar_wav = run_demucs(job_id, src)
+        # 1) Crop to 90 s so Demucs finishes in ~30-45 s instead of 2-3 min
+        set_job(job_id, status="running", progress=8, message="Preparing audio…")
+        src_90 = _crop_to_90s(src)
 
-        # 2) Detect tuning
+        # 2) Separate stems with Demucs
+        set_job(job_id, status="running", progress=10,
+                message="Separating guitar track with Demucs…")
+        guitar_wav = run_demucs(job_id, src_90)
+
+        # 3) Detect tuning
         set_job(job_id, status="running", progress=50, message="Detecting guitar tuning…")
         tuning_name, open_strings = detect_tuning(guitar_wav)
 
-        # 3) Detect overdrive/distortion
+        # 4) Detect overdrive/distortion
         set_job(job_id, status="running", progress=58, message="Analysing amp tone…")
         overdrive_info = detect_overdrive(guitar_wav)
 
-        # 4) Transcribe notes
+        # 5) Transcribe notes
         set_job(job_id, status="running", progress=65, message="Transcribing notes…")
         notes = run_basic_pitch(job_id, guitar_wav)
 
-        # 5) Build tab
+        # 6) Build tab
         set_job(job_id, status="running", progress=85, message="Building guitar tab…")
         tab_text, tab_data, timings = build_tab(notes, open_strings, tuning_name)
 
@@ -168,15 +209,15 @@ def process_audio(job_id, src: Path):
 
 
 def run_demucs(job_id, src: Path) -> Path:
-    import sys
-    import subprocess
     import torch
+    from demucs.separate import main as demucs_main
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_root = OUTPUT_DIR / job_id
-    worker = Path(__file__).parent / "demucs_worker.py"
 
-    # Slowly advance progress bar (10 → 45 %) while Demucs runs.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     _stop = threading.Event()
 
     def _ticker():
@@ -184,32 +225,21 @@ def run_demucs(job_id, src: Path) -> Path:
         while not _stop.wait(6):
             pct = min(pct + 3, 45)
             set_job(job_id, progress=pct,
-                    message=f"Separating guitar track with Demucs on {device.upper()}…")
+                    message=f"Separating guitar track ({device.upper()})…")
 
-    ticker = threading.Thread(target=_ticker, daemon=True)
-    ticker.start()
+    t = threading.Thread(target=_ticker, daemon=True)
+    t.start()
 
     try:
-        # Run Demucs in a subprocess so each job gets a clean CUDA/PyTorch
-        # state. Calling demucs_main() repeatedly in-process accumulates GPU
-        # state between jobs and causes intermittent hangs.
-        result = subprocess.run(
-            [sys.executable, str(worker),
-             "-n", "htdemucs_6s",
-             "--device", device,
-             "-o", str(out_root),
-             str(src)],
-            capture_output=True, text=True, timeout=360,
-        )
-        if result.returncode != 0:
-            tail = (result.stderr or "")[-800:]
-            raise RuntimeError(f"Demucs failed (exit {result.returncode}):\n{tail}")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Demucs timed out after 6 minutes")
+        demucs_main([
+            "-n", "htdemucs_6s",
+            "--device", device,
+            "-o", str(out_root),
+            str(src),
+        ])
     finally:
         _stop.set()
 
-    # htdemucs_6s produces: drums, bass, guitar, piano, vocals, other
     stem_root = out_root / "htdemucs_6s" / src.stem
     guitar_path = stem_root / "guitar.wav"
     if not guitar_path.exists():
@@ -303,29 +333,47 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    """Polyphonic guitar transcription: onset detection + CQT peak picking."""
+    """Polyphonic guitar transcription using harmonic salience + onset detection.
+
+    Raw CQT peak-picking fails on Demucs guitar stems because distorted guitar
+    has harmonics at ALL frequencies — every bin looks like a "peak".
+
+    The harmonic salience function fixes this: for each bin b, salience[b] =
+    mag[b] + 0.5*mag[b+12] + 0.33*mag[b+19] + 0.25*mag[b+24]. Genuine
+    fundamentals score high (their harmonics reinforce them); random harmonic
+    overtones score low (their "harmonics" are usually absent).  Peaks in the
+    salience spectrum are real notes; peaks in raw CQT are often noise.
+    """
     import librosa
     import numpy as np
     from scipy.signal import find_peaks
 
-    y, sr = librosa.load(str(wav_path), mono=True)
+    # Load first 90 s only — the stem from a 4-minute song needs 3+ min of
+    # CQT computation on CPU; 90 s takes ~5 s and covers intro + verse.
+    y, sr = librosa.load(str(wav_path), mono=True, duration=90.0)
     hop = 512
 
-    # ── CQT: start at D2 (MIDI 38) so drop-D and similar tunings are covered ─
-    # Starting at E2 (old fmin) misses the open low string in Drop D / Open G.
+    # CQT starting at D2 (MIDI 38) so Drop-D and similar tunings are in range
     fmin = librosa.note_to_hz("D2")   # 73.4 Hz
     FMIN_MIDI = 38
-    n_bins = 62  # D2 → ~MIDI 100 (covers all playable guitar positions)
-    C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop, fmin=fmin,
-                             n_bins=n_bins, bins_per_octave=12))
+    n_bins = 62  # D2 → ~MIDI 100
+    C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop,
+                             fmin=fmin, n_bins=n_bins, bins_per_octave=12))
 
-    # Global noise floor: the 40th percentile of the whole CQT is background
-    # noise (room tone, Demucs bleed, etc.).  Only trust onsets that are clearly
-    # above this baseline.
-    noise_floor = float(np.percentile(C, 40))
-    song_max    = float(C.max())
+    # ── Harmonic salience ────────────────────────────────────────────────────
+    # For CQT with 12 bins/octave:
+    #   2nd harmonic of bin b → bin b+12  (one octave)
+    #   3rd harmonic           → bin b+19  (≈19.02 semitones)
+    #   4th harmonic           → bin b+24  (two octaves)
+    sal = C.astype(np.float32).copy()
+    for off, w in [(12, 0.50), (19, 0.33), (24, 0.25)]:
+        if off < n_bins:
+            sal[:n_bins - off, :] += w * C[off:, :]
 
-    # ── Onset detection ───────────────────────────────────────────────────────
+    sal_noise = float(np.percentile(sal, 40))   # background noise level in salience
+    sal_max   = float(sal.max())
+
+    # ── Onset detection (on raw CQT strength, not salience) ─────────────────
     onset_env = librosa.onset.onset_strength(
         S=librosa.amplitude_to_db(C, ref=np.max),
         sr=sr, hop_length=hop,
@@ -334,7 +382,7 @@ def run_basic_pitch(job_id, wav_path: Path):
         onset_envelope=onset_env, sr=sr, hop_length=hop,
         backtrack=True, units="frames",
         pre_max=3, post_max=3, pre_avg=7, post_avg=7,
-        delta=0.45, wait=8,     # stricter: fewer false-positive onsets
+        delta=0.40, wait=8,    # 8 frames ≈ 93 ms minimum spacing between onsets
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
@@ -344,45 +392,42 @@ def run_basic_pitch(job_id, wav_path: Path):
     notes = []
 
     for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
-        win_end = min(frame + 10, C.shape[1])
-        if frame >= C.shape[1]:
+        win_end = min(frame + 10, sal.shape[1])
+        if frame >= sal.shape[1]:
             continue
 
-        # Average 10 frames starting at the onset — more stable than a single
-        # frame, and reduces random frame-to-frame noise spikes.
-        mag = C[:, frame:win_end].mean(axis=1)
-
+        # Average salience over 10 frames for stability
+        mag = sal[:, frame:win_end].mean(axis=1)
         peak_mag = float(mag.max())
 
-        # Skip silent / noise onsets (Demucs separation bleeds noise at all
-        # frequencies; filtering here stops us from detecting "notes" in silence).
-        if peak_mag < max(noise_floor * 5.0, song_max * 0.04):
+        # Skip onsets where nothing sticks out above the noise floor
+        if peak_mag < max(sal_noise * 4.0, sal_max * 0.04):
             continue
 
-        # scipy find_peaks finds peaks that stand out from their local baseline
-        # (prominence), unlike a simple local-max check which picks noise bumps.
-        min_h = max(noise_floor * 2.5, peak_mag * 0.30)
+        # find_peaks with prominence: requires peaks to stand out from their
+        # LOCAL surroundings, not just clear an absolute threshold.
+        min_h = max(sal_noise * 2.0, peak_mag * 0.28)
         peaks, _ = find_peaks(
             mag,
-            height=min_h,       # absolute floor
-            distance=2,         # no two detected peaks < 2 bins apart
-            prominence=noise_floor,  # must protrude above local surroundings
+            height=min_h,
+            distance=2,
+            prominence=sal_noise * 0.8,
         )
         if len(peaks) == 0:
             continue
 
-        # Rank by magnitude, keep at most 3 strongest candidates.
-        # Picking 6 "notes" from a noisy spectrum produces harmonic chaos.
+        # Keep top 3 by salience magnitude (chord tones: root + 3rd/5th at most)
         peaks = peaks[np.argsort(mag[peaks])[::-1][:3]]
 
-        # Harmonic suppression: if bin b_hi ≈ N × f(b_lo) for any already-kept
-        # bin b_lo (N = 2, 3, 4), it's an overtone — discard it.
+        # Harmonic suppression on RAW CQT (not salience) to avoid self-reinforcing
+        raw = C[:, frame:win_end].mean(axis=1)
+
         def is_harmonic(b_hi, kept):
             f_hi = fmin * 2 ** (b_hi / 12)
             for b_lo in kept:
                 f_lo = fmin * 2 ** (b_lo / 12)
                 for h in [2, 3, 4]:
-                    if abs(f_hi / f_lo - h) < 0.09 and mag[b_lo] >= 0.35 * mag[b_hi]:
+                    if abs(f_hi / f_lo - h) < 0.09 and raw[b_lo] >= 0.32 * raw[b_hi]:
                         return True
             return False
 
