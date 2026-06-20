@@ -56,13 +56,28 @@
       <div class="result-header">
         <div>
           <h2>Tab Generated</h2>
-          <span class="tuning-badge" id="tuningBadge">Tuning: —</span>
+          <div class="badge-row">
+            <span class="tuning-badge" id="tuningBadge">Tuning: —</span>
+            <span class="overdrive-badge hidden" id="overdriveBadge"></span>
+          </div>
         </div>
-        <button class="btn-primary" id="downloadBtn">⬇ Download .txt</button>
+        <button class="btn-primary" id="downloadBtn">Download .txt</button>
       </div>
 
-      <div class="tab-viewer" id="tabViewer">
-        <pre id="tabPre"></pre>
+      <!-- Playback bar -->
+      <div class="playback-bar" id="playbackBar">
+        <button class="play-btn" id="playBtn">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M8 5v14l11-7z"/></svg>
+          Play
+        </button>
+        <button class="stop-btn hidden" id="stopBtn">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><rect x="6" y="6" width="12" height="12"/></svg>
+          Stop
+        </button>
+        <div class="playback-timeline">
+          <div class="playback-cursor" id="playCursor"></div>
+        </div>
+        <span class="playback-hint">Synthesised guitar preview</span>
       </div>
 
       <div class="visual-tab" id="visualTab"></div>

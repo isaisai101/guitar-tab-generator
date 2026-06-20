@@ -127,18 +127,22 @@ def process_audio(job_id, src: Path):
         guitar_wav = run_demucs(job_id, src)
 
         # 2) Detect tuning
-        set_job(job_id, status="running", progress=55, message="Detecting guitar tuning…")
+        set_job(job_id, status="running", progress=50, message="Detecting guitar tuning…")
         tuning_name, open_strings = detect_tuning(guitar_wav)
 
-        # 3) Transcribe with Basic Pitch
-        set_job(job_id, status="running", progress=65, message="Transcribing notes with Basic Pitch…")
+        # 3) Detect overdrive/distortion
+        set_job(job_id, status="running", progress=58, message="Analysing amp tone…")
+        overdrive_info = detect_overdrive(guitar_wav)
+
+        # 4) Transcribe notes
+        set_job(job_id, status="running", progress=65, message="Transcribing notes…")
         notes = run_basic_pitch(job_id, guitar_wav)
 
-        # 4) Build tab
+        # 5) Build tab
         set_job(job_id, status="running", progress=85, message="Building guitar tab…")
-        tab_text, tab_data = build_tab(notes, open_strings, tuning_name)
+        tab_text, tab_data, timings = build_tab(notes, open_strings, tuning_name)
 
-        # 5) Save tab
+        # 6) Save tab
         tab_path = OUTPUT_DIR / f"{job_id}_tab.txt"
         tab_path.write_text(tab_text, encoding="utf-8")
 
@@ -147,7 +151,13 @@ def process_audio(job_id, src: Path):
             status="done",
             progress=100,
             message="Done",
-            result={"tuning": tuning_name, "tab": tab_data, "tab_text": tab_text}
+            result={
+                "tuning": tuning_name,
+                "tab": tab_data,
+                "timings": timings,
+                "tab_text": tab_text,
+                "overdrive": overdrive_info,
+            }
         )
     except Exception as e:
         set_job(job_id, status="error", message=str(e))
@@ -177,6 +187,49 @@ def run_demucs(job_id, src: Path) -> Path:
     if not guitar_path.exists():
         raise RuntimeError(f"Could not find guitar stem in {stem_root}")
     return guitar_path
+
+
+def detect_overdrive(wav_path: Path) -> dict:
+    import librosa
+    import numpy as np
+
+    y, sr = librosa.load(str(wav_path), mono=True, duration=30)
+    if len(y) == 0:
+        return {"detected": False, "level": "Clean", "score": 0.0}
+
+    # Spectral flatness: 0 = pure tone, 1 = white noise; distortion → higher
+    flatness = librosa.feature.spectral_flatness(y=y)
+    mean_flatness = float(np.mean(flatness))
+
+    # Zero-crossing rate: clipping adds high-freq content → more ZC
+    zcr = librosa.feature.zero_crossing_rate(y)
+    mean_zcr = float(np.mean(zcr))
+
+    # Hard clipping ratio: overdriven signal spends more time at peak
+    peak = float(np.max(np.abs(y))) or 1.0
+    clip_ratio = float(np.mean(np.abs(y) > 0.80 * peak))
+
+    # Weighted score
+    score = (
+        min(mean_flatness / 0.25, 3.0) * 0.5 +
+        min(mean_zcr / 0.12, 3.0) * 0.3 +
+        min(clip_ratio / 0.03, 3.0) * 0.2
+    )
+
+    if score >= 2.0:
+        level = "Heavy"
+    elif score >= 1.3:
+        level = "Medium"
+    elif score >= 0.8:
+        level = "Light"
+    else:
+        level = "Clean"
+
+    return {
+        "detected": score >= 0.8,
+        "level": level,
+        "score": round(score, 3),
+    }
 
 
 def detect_tuning(wav_path: Path):
@@ -281,9 +334,7 @@ def build_tab(notes, open_strings, tuning_name):
 
     # bucket notes into columns by time
     if not notes:
-        empty = {l: ["-" * (COL_WIDTH * COLS_PER_LINE)] for l in STRING_LABELS}
-        tab_data = [{"strings": {l: ["--"] for l in STRING_LABELS}, "col": 0} for _ in range(1)]
-        return _render_tab_text([], STRING_LABELS, tuning_name), []
+        return _render_tab_text([], STRING_LABELS, tuning_name), [], []
 
     duration = notes[-1]["end"] if notes else 1.0
     duration = max(duration, 0.1)
@@ -305,7 +356,7 @@ def build_tab(notes, open_strings, tuning_name):
 
     # Sort by time, group into columns (notes within 0.05s = same column)
     tab_events.sort(key=lambda e: e["time"])
-    grouped = []
+    grouped = []  # list of (time, [events])
     current_group = []
     current_time = None
     for ev in tab_events:
@@ -314,21 +365,23 @@ def build_tab(notes, open_strings, tuning_name):
             if current_time is None:
                 current_time = ev["time"]
         else:
-            grouped.append(current_group)
+            grouped.append((current_time, current_group))
             current_group = [ev]
             current_time = ev["time"]
     if current_group:
-        grouped.append(current_group)
+        grouped.append((current_time, current_group))
 
     columns = []
-    for group in grouped:
+    timings = []  # seconds timestamp per column for playback
+    for t, group in grouped:
         col = {l: "-" for l in STRING_LABELS}
         for ev in group:
             col[ev["string"]] = str(ev["fret"])
         columns.append(col)
+        timings.append(round(t, 3))
 
     tab_text = _render_tab_text(columns, STRING_LABELS, tuning_name)
-    return tab_text, columns
+    return tab_text, columns, timings
 
 
 def _render_tab_text(columns, string_labels, tuning_name):
