@@ -233,8 +233,8 @@ def detect_overdrive(wav_path: Path) -> dict:
     # 4. High-freq energy ratio: distortion generates strong harmonics above 1 kHz
     stft = np.abs(librosa.stft(y, n_fft=2048))
     freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
-    lo_e = stft[freqs < 800].mean() + 1e-8
-    hi_e = stft[(freqs >= 800) & (freqs < 8000)].mean() + 1e-8
+    lo_e = float(stft[freqs < 800].mean()) + 1e-8
+    hi_e = float(stft[(freqs >= 800) & (freqs < 8000)].mean()) + 1e-8
     hi_ratio = hi_e / lo_e  # clean ~0.1–0.25, distorted ~0.3–0.9
 
     # Normalise each feature into a 0-3 contribution (higher = more distortion)
@@ -255,9 +255,9 @@ def detect_overdrive(wav_path: Path) -> dict:
         level = "Clean"
 
     return {
-        "detected": score >= 0.5,
+        "detected": bool(score >= 0.5),
         "level": level,
-        "score": round(score, 3),
+        "score": round(float(score), 3),
     }
 
 
