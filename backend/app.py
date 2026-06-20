@@ -8,6 +8,24 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 
+# Patch torchaudio.save to use soundfile — torchcodec requires FFmpeg shared
+# DLLs that are not reliably present on Windows. soundfile works everywhere.
+def _patch_torchaudio():
+    try:
+        import torchaudio
+        import soundfile as sf
+
+        def _sf_save(uri, src, sample_rate, bits_per_sample=16, **kwargs):
+            wav_np = src.numpy().T  # (samples, channels)
+            subtype = "PCM_16" if bits_per_sample <= 16 else "PCM_24"
+            sf.write(str(uri), wav_np, int(sample_rate), subtype=subtype)
+
+        torchaudio.save = _sf_save
+    except Exception:
+        pass  # if torchaudio isn't installed, nothing to patch
+
+_patch_torchaudio()
+
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 CORS(app)
 
@@ -138,26 +156,23 @@ def process_audio(job_id, src: Path):
 
 def run_demucs(job_id, src: Path) -> Path:
     import torch
-    import sys
+    from demucs.separate import main as demucs_main
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_root = OUTPUT_DIR / job_id
-    cmd = [
-        sys.executable, "-m", "demucs",
+
+    # Run in-process so the torchaudio.save patch above is in effect
+    demucs_main([
         "-n", "htdemucs_6s",
         "--device", device,
         "-o", str(out_root),
-        str(src)
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Demucs failed:\n{result.stderr}")
+        str(src),
+    ])
 
     # htdemucs_6s produces: drums, bass, guitar, piano, vocals, other
-    # We want the guitar stem specifically
     stem_root = out_root / "htdemucs_6s" / src.stem
     guitar_path = stem_root / "guitar.wav"
     if not guitar_path.exists():
-        # fallback: take 'other' stem
         guitar_path = stem_root / "other.wav"
     if not guitar_path.exists():
         raise RuntimeError(f"Could not find guitar stem in {stem_root}")
