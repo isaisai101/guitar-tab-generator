@@ -168,34 +168,44 @@ def process_audio(job_id, src: Path):
 
 
 def run_demucs(job_id, src: Path) -> Path:
+    import sys
+    import subprocess
     import torch
-    from demucs.separate import main as demucs_main
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_root = OUTPUT_DIR / job_id
+    worker = Path(__file__).parent / "demucs_worker.py"
 
-    # Slowly advance progress bar (10 → 45 %) while Demucs runs on the GPU.
-    # This gives the user visual feedback during what can be a 1-3 min wait.
+    # Slowly advance progress bar (10 → 45 %) while Demucs runs.
     _stop = threading.Event()
 
     def _ticker():
         pct = 10
-        while not _stop.wait(6):   # fires every 6 s
+        while not _stop.wait(6):
             pct = min(pct + 3, 45)
             set_job(job_id, progress=pct,
                     message=f"Separating guitar track with Demucs on {device.upper()}…")
 
-    t = threading.Thread(target=_ticker, daemon=True)
-    t.start()
+    ticker = threading.Thread(target=_ticker, daemon=True)
+    ticker.start()
 
     try:
-        # Run in-process so the torchaudio.save patch above is in effect
-        demucs_main([
-            "-n", "htdemucs_6s",
-            "--device", device,
-            "-o", str(out_root),
-            str(src),
-        ])
+        # Run Demucs in a subprocess so each job gets a clean CUDA/PyTorch
+        # state. Calling demucs_main() repeatedly in-process accumulates GPU
+        # state between jobs and causes intermittent hangs.
+        result = subprocess.run(
+            [sys.executable, str(worker),
+             "-n", "htdemucs_6s",
+             "--device", device,
+             "-o", str(out_root),
+             str(src)],
+            capture_output=True, text=True, timeout=360,
+        )
+        if result.returncode != 0:
+            tail = (result.stderr or "")[-800:]
+            raise RuntimeError(f"Demucs failed (exit {result.returncode}):\n{tail}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Demucs timed out after 6 minutes")
     finally:
         _stop.set()
 
@@ -293,26 +303,29 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    """Polyphonic guitar transcription: onset detection + CQT peak picking.
-
-    pyin is monophonic (single note only) — useless for chords and distorted
-    guitar.  This approach detects onsets (chord strikes / note attacks) and at
-    each onset finds ALL significant frequency peaks in the CQT spectrum, giving
-    us chord detection and much better accuracy on distorted signals.
-    """
+    """Polyphonic guitar transcription: onset detection + CQT peak picking."""
     import librosa
     import numpy as np
+    from scipy.signal import find_peaks
 
     y, sr = librosa.load(str(wav_path), mono=True)
     hop = 512
 
-    # ── CQT covering full guitar range (E2 MIDI-40 → 5 octaves) ─────────────
-    fmin = librosa.note_to_hz("E2")   # 82.4 Hz, MIDI 40
-    n_bins = 60                        # 5 octaves × 12 bins/oct → up to MIDI 100
+    # ── CQT: start at D2 (MIDI 38) so drop-D and similar tunings are covered ─
+    # Starting at E2 (old fmin) misses the open low string in Drop D / Open G.
+    fmin = librosa.note_to_hz("D2")   # 73.4 Hz
+    FMIN_MIDI = 38
+    n_bins = 62  # D2 → ~MIDI 100 (covers all playable guitar positions)
     C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop, fmin=fmin,
                              n_bins=n_bins, bins_per_octave=12))
 
-    # ── Onset detection on CQT-derived spectral flux ──────────────────────────
+    # Global noise floor: the 40th percentile of the whole CQT is background
+    # noise (room tone, Demucs bleed, etc.).  Only trust onsets that are clearly
+    # above this baseline.
+    noise_floor = float(np.percentile(C, 40))
+    song_max    = float(C.max())
+
+    # ── Onset detection ───────────────────────────────────────────────────────
     onset_env = librosa.onset.onset_strength(
         S=librosa.amplitude_to_db(C, ref=np.max),
         sr=sr, hop_length=hop,
@@ -320,8 +333,8 @@ def run_basic_pitch(job_id, wav_path: Path):
     onset_frames = librosa.onset.onset_detect(
         onset_envelope=onset_env, sr=sr, hop_length=hop,
         backtrack=True, units="frames",
-        pre_max=3, post_max=3, pre_avg=5, post_avg=5,
-        delta=0.25, wait=3,
+        pre_max=3, post_max=3, pre_avg=7, post_avg=7,
+        delta=0.45, wait=8,     # stricter: fewer false-positive onsets
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
@@ -331,62 +344,64 @@ def run_basic_pitch(job_id, wav_path: Path):
     notes = []
 
     for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
-        # Short window right after the onset to measure attack spectrum
-        win_end = min(frame + 6, C.shape[1])
+        win_end = min(frame + 10, C.shape[1])
         if frame >= C.shape[1]:
             continue
 
-        mag = C[:, frame:win_end].max(axis=1)   # peak magnitude per pitch bin
+        # Average 10 frames starting at the onset — more stable than a single
+        # frame, and reduces random frame-to-frame noise spikes.
+        mag = C[:, frame:win_end].mean(axis=1)
 
-        # Find local spectral peaks (must be locally maximal)
-        peaks = []
-        for b in range(1, len(mag) - 1):
-            if mag[b] > mag[b - 1] and mag[b] >= mag[b + 1]:
-                peaks.append((b, float(mag[b])))
-        if not peaks:
+        peak_mag = float(mag.max())
+
+        # Skip silent / noise onsets (Demucs separation bleeds noise at all
+        # frequencies; filtering here stops us from detecting "notes" in silence).
+        if peak_mag < max(noise_floor * 5.0, song_max * 0.04):
             continue
 
-        # Keep only peaks above 25 % of the strongest peak in this window
-        max_mag = max(m for _, m in peaks)
-        if max_mag == 0:
+        # scipy find_peaks finds peaks that stand out from their local baseline
+        # (prominence), unlike a simple local-max check which picks noise bumps.
+        min_h = max(noise_floor * 2.5, peak_mag * 0.30)
+        peaks, _ = find_peaks(
+            mag,
+            height=min_h,       # absolute floor
+            distance=2,         # no two detected peaks < 2 bins apart
+            prominence=noise_floor,  # must protrude above local surroundings
+        )
+        if len(peaks) == 0:
             continue
-        peaks = [(b, m) for b, m in peaks if m >= 0.25 * max_mag]
 
-        # Suppress harmonics: if bin b ≈ N × bin a (N = 2,3,4) and a is at
-        # least 40 % as loud, bin b is a harmonic — remove it to avoid
-        # duplicating the fundamental at its octave.
+        # Rank by magnitude, keep at most 3 strongest candidates.
+        # Picking 6 "notes" from a noisy spectrum produces harmonic chaos.
+        peaks = peaks[np.argsort(mag[peaks])[::-1][:3]]
+
+        # Harmonic suppression: if bin b_hi ≈ N × f(b_lo) for any already-kept
+        # bin b_lo (N = 2, 3, 4), it's an overtone — discard it.
         def is_harmonic(b_hi, kept):
             f_hi = fmin * 2 ** (b_hi / 12)
-            for b_lo, m_lo in kept:
+            for b_lo in kept:
                 f_lo = fmin * 2 ** (b_lo / 12)
                 for h in [2, 3, 4]:
-                    if abs(f_hi / f_lo - h) < 0.09 and m_lo >= 0.40 * mag[b_hi]:
+                    if abs(f_hi / f_lo - h) < 0.09 and mag[b_lo] >= 0.35 * mag[b_hi]:
                         return True
             return False
 
-        peaks.sort(key=lambda x: -x[1])   # strongest first
         kept = []
-        for b, m in peaks:
+        for b in peaks:
             if not is_harmonic(b, kept):
-                kept.append((b, m))
-            if len(kept) >= 6:             # at most one note per string
-                break
+                kept.append(int(b))
 
-        # Duration = gap to next onset, capped at 2 s
-        if i + 1 < len(onset_times):
-            dur = min(onset_times[i + 1] - onset_t, 2.0)
-        else:
-            dur = 0.5
-        dur = max(dur, 0.05)
+        dur = float(onset_times[i + 1] - onset_t) if i + 1 < len(onset_times) else 0.5
+        dur = max(min(dur, 2.0), 0.06)
 
-        for b, _ in kept:
-            midi = 40 + b                  # E2 (bin 0) = MIDI 40
-            if not (40 <= midi <= 88):
+        for b in kept:
+            midi = FMIN_MIDI + b
+            if not (38 <= midi <= 88):
                 continue
             notes.append({
-                "start":    round(onset_t, 3),
-                "end":      round(onset_t + dur, 3),
-                "pitch":    int(midi),
+                "start":    round(float(onset_t), 3),
+                "end":      round(float(onset_t) + dur, 3),
+                "pitch":    midi,
                 "velocity": 80,
             })
 
