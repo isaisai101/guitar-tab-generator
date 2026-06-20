@@ -26,6 +26,30 @@ def _patch_torchaudio():
 
 _patch_torchaudio()
 
+
+def _ensure_ffmpeg_in_path():
+    """Add the winget-installed ffmpeg to PATH if it isn't already findable.
+
+    On Windows, winget installs ffmpeg into the USER PATH, not MACHINE PATH.
+    Flask subprocesses (yt-dlp, ffmpeg crop) inherit only the environment of
+    the process that launched Flask, which may not include the user PATH.
+    """
+    import shutil, glob, os
+    if shutil.which("ffmpeg"):
+        return
+    base = os.path.expandvars("%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages")
+    for exe in glob.glob(os.path.join(base, "Gyan.FFmpeg*", "**", "ffmpeg.exe"),
+                         recursive=True):
+        bin_dir = os.path.dirname(exe)
+        os.environ["PATH"] = bin_dir + ";" + os.environ.get("PATH", "")
+        print(f"[startup] ffmpeg added to PATH: {bin_dir}")
+        return
+    print("[startup] WARNING: ffmpeg not found — YouTube downloads may fail")
+
+
+_ensure_ffmpeg_in_path()
+
+
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 CORS(app)
 
@@ -121,7 +145,10 @@ def process_youtube(job_id, url):
             "-o", str(out_path),
             url
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            raise RuntimeError(f"yt-dlp failed:\n{stderr[-600:]}")
         matches = list(UPLOAD_DIR.glob(f"{job_id}.*"))
         if not matches:
             raise RuntimeError("yt-dlp produced no output file")
@@ -333,47 +360,47 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    """Polyphonic guitar transcription using harmonic salience + onset detection.
+    """Polyphonic guitar transcription using log-HPS + onset detection.
 
-    Raw CQT peak-picking fails on Demucs guitar stems because distorted guitar
-    has harmonics at ALL frequencies — every bin looks like a "peak".
+    WHY log-HPS instead of additive salience:
+    Additive salience: sal[b] = C[b] + 0.5*C[b+12] + ...
+      → Playing E4 adds 0.25*C[E4] to bin E2, creating a GHOST E2 note.
+      → Open E detected as a chord containing E2, E3, E4 (wrong).
 
-    The harmonic salience function fixes this: for each bin b, salience[b] =
-    mag[b] + 0.5*mag[b+12] + 0.33*mag[b+19] + 0.25*mag[b+24]. Genuine
-    fundamentals score high (their harmonics reinforce them); random harmonic
-    overtones score low (their "harmonics" are usually absent).  Peaks in the
-    salience spectrum are real notes; peaks in raw CQT are often noise.
+    Log-HPS: log_hps[b] = log C[b] + log C[b+12] + log C[b+19] + log C[b+24]
+      → If C[b] ≈ 0 (no note there), log C[b] is very negative → hps[b] ≈ 0
+        regardless of what harmonics are present.
+      → Only GENUINE fundamentals (where the bin itself has energy) score high.
+      → Open E4 no longer creates a false E2 detection.
     """
     import librosa
     import numpy as np
     from scipy.signal import find_peaks
 
-    # Load first 90 s only — the stem from a 4-minute song needs 3+ min of
-    # CQT computation on CPU; 90 s takes ~5 s and covers intro + verse.
     y, sr = librosa.load(str(wav_path), mono=True, duration=90.0)
     hop = 512
 
-    # CQT starting at D2 (MIDI 38) so Drop-D and similar tunings are in range
-    fmin = librosa.note_to_hz("D2")   # 73.4 Hz
+    fmin = librosa.note_to_hz("D2")   # 73.4 Hz, MIDI 38 — covers Drop D
     FMIN_MIDI = 38
-    n_bins = 62  # D2 → ~MIDI 100
+    n_bins = 62
     C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop,
                              fmin=fmin, n_bins=n_bins, bins_per_octave=12))
 
-    # ── Harmonic salience ────────────────────────────────────────────────────
-    # For CQT with 12 bins/octave:
-    #   2nd harmonic of bin b → bin b+12  (one octave)
-    #   3rd harmonic           → bin b+19  (≈19.02 semitones)
-    #   4th harmonic           → bin b+24  (two octaves)
-    sal = C.astype(np.float32).copy()
-    for off, w in [(12, 0.50), (19, 0.33), (24, 0.25)]:
+    # ── Log Harmonic Product Spectrum ────────────────────────────────────────
+    # hps[b] ∝ C[b] × C[b+12] × C[b+19] × C[b+24]  (computed in log space)
+    # 12 bins = 2nd harmonic (octave), 19 = 3rd, 24 = 4th (two octaves)
+    eps = max(float(np.percentile(C, 5)), 1e-9)
+    log_C   = np.log(C.astype(np.float32) + eps)
+    log_hps = log_C.copy()
+    for off in [12, 19, 24]:
         if off < n_bins:
-            sal[:n_bins - off, :] += w * C[off:, :]
+            log_hps[:n_bins - off, :] += log_C[off:, :]
+    hps = np.exp(log_hps - log_hps.max())  # normalise; relative values are what matter
 
-    sal_noise = float(np.percentile(sal, 40))   # background noise level in salience
-    sal_max   = float(sal.max())
+    hps_noise = float(np.percentile(hps, 60))
+    hps_max   = float(hps.max())
 
-    # ── Onset detection (on raw CQT strength, not salience) ─────────────────
+    # ── Onset detection on raw CQT (more responsive than HPS for transients) ─
     onset_env = librosa.onset.onset_strength(
         S=librosa.amplitude_to_db(C, ref=np.max),
         sr=sr, hop_length=hop,
@@ -382,7 +409,7 @@ def run_basic_pitch(job_id, wav_path: Path):
         onset_envelope=onset_env, sr=sr, hop_length=hop,
         backtrack=True, units="frames",
         pre_max=3, post_max=3, pre_avg=7, post_avg=7,
-        delta=0.40, wait=8,    # 8 frames ≈ 93 ms minimum spacing between onsets
+        delta=0.40, wait=8,
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
@@ -392,42 +419,44 @@ def run_basic_pitch(job_id, wav_path: Path):
     notes = []
 
     for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
-        win_end = min(frame + 10, sal.shape[1])
-        if frame >= sal.shape[1]:
+        win_end = min(frame + 10, hps.shape[1])
+        if frame >= hps.shape[1]:
             continue
 
-        # Average salience over 10 frames for stability
-        mag = sal[:, frame:win_end].mean(axis=1)
+        mag = hps[:, frame:win_end].mean(axis=1)
         peak_mag = float(mag.max())
 
-        # Skip onsets where nothing sticks out above the noise floor
-        if peak_mag < max(sal_noise * 4.0, sal_max * 0.04):
+        if peak_mag < max(hps_noise * 6.0, hps_max * 0.04):
             continue
 
-        # find_peaks with prominence: requires peaks to stand out from their
-        # LOCAL surroundings, not just clear an absolute threshold.
-        min_h = max(sal_noise * 2.0, peak_mag * 0.28)
+        min_h = max(hps_noise * 3.0, peak_mag * 0.25)
         peaks, _ = find_peaks(
             mag,
             height=min_h,
             distance=2,
-            prominence=sal_noise * 0.8,
+            prominence=hps_noise * 1.5,
         )
         if len(peaks) == 0:
             continue
 
-        # Keep top 3 by salience magnitude (chord tones: root + 3rd/5th at most)
-        peaks = peaks[np.argsort(mag[peaks])[::-1][:3]]
+        # Limit to top-2: covers single notes and power chords (root+fifth).
+        # Taking more peaks from a noisy stem causes harmonic clutter.
+        peaks = peaks[np.argsort(mag[peaks])[::-1][:2]]
 
-        # Harmonic suppression on RAW CQT (not salience) to avoid self-reinforcing
         raw = C[:, frame:win_end].mean(axis=1)
 
         def is_harmonic(b_hi, kept):
             f_hi = fmin * 2 ** (b_hi / 12)
             for b_lo in kept:
                 f_lo = fmin * 2 ** (b_lo / 12)
+                # b_hi is an overtone of b_lo (b_hi > b_lo)
                 for h in [2, 3, 4]:
-                    if abs(f_hi / f_lo - h) < 0.09 and raw[b_lo] >= 0.32 * raw[b_hi]:
+                    if abs(f_hi / f_lo - h) < 0.09 and raw[b_lo] >= 0.28 * raw[b_hi]:
+                        return True
+                # b_hi is a ghost sub-harmonic: b_lo is actually one of b_hi's
+                # harmonics, and b_hi has very little raw energy of its own
+                for h in [2, 3, 4]:
+                    if abs(f_lo / f_hi - h) < 0.09 and raw[b_hi] < 0.35 * raw[b_lo]:
                         return True
             return False
 
