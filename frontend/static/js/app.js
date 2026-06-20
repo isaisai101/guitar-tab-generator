@@ -242,23 +242,34 @@ function renderVisualTab(columns) {
 // ── Web Audio Playback ─────────────────────────────────────────────────────
 const OPEN_MIDI = { e: 64, B: 59, G: 55, D: 50, A: 45, E: 40 };
 
-let audioCtx     = null;
-let playNodes    = [];
-let playRaf      = null;
-let playStart    = 0;   // audioCtx.currentTime when playback began
-let playDuration = 0;   // total seconds
+let audioCtx      = null;
+let playNodes     = [];
+let playRaf       = null;
+let playStart     = 0;   // audioCtx.currentTime when playback began
+let playDuration  = 0;   // total normalised seconds
+let normTimings   = [];  // timings shifted so first note = 0
 
 function midiToFreq(midi) {
   return 440 * Math.pow(2, (midi - 69) / 12);
 }
 
+// Soft-clip distortion curve (heavier at higher amount)
 function makeDistortionCurve(amount) {
-  const n = 256, curve = new Float32Array(n);
+  const n = 512, curve = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const x = (i * 2) / n - 1;
     curve[i] = ((Math.PI + amount) * x) / (Math.PI + amount * Math.abs(x));
   }
   return curve;
+}
+
+// Plucked-string PeriodicWave (approximates decaying guitar harmonics)
+function getGuitarWave(ctx) {
+  const harmonics = [0, 1, 0.5, 0.25, 0.12, 0.06, 0.03, 0.015];
+  const real = new Float32Array(harmonics.length);
+  const imag = new Float32Array(harmonics.length);
+  real.set(harmonics);
+  return ctx.createPeriodicWave(real, imag, { disableNormalization: false });
 }
 
 playBtn.addEventListener("click", startPlayback);
@@ -269,16 +280,38 @@ function startPlayback() {
   stopPlayback();
 
   audioCtx = audioCtx || new AudioContext();
+
+  // ── Timing normalisation ───────────────────────────────────────────────
+  // Shift all timings so the first detected note plays immediately at t=0.
+  // Without this, if the guitar enters at 5 s in the track, playback begins
+  // with 5 s of silence and then rushes — making speed feel wrong.
+  const offset = tabTimings.length > 0 ? tabTimings[0] : 0;
+  normTimings = tabTimings.map(t => t - offset);
+
+  const lastNorm = normTimings.length > 0 ? normTimings[normTimings.length - 1] : tabColumns.length * 0.12;
+  playDuration = lastNorm + 1.2;
+
   const now = audioCtx.currentTime + 0.05;
   playStart = now;
-
-  const lastTime = tabTimings.length ? tabTimings[tabTimings.length - 1] : tabColumns.length * 0.15;
-  playDuration = lastTime + 1.0;
-
   playNodes = [];
 
+  // ── Shared compressor ─────────────────────────────────────────────────
+  const comp = audioCtx.createDynamicsCompressor();
+  comp.threshold.setValueAtTime(-20, now);
+  comp.knee.setValueAtTime(10, now);
+  comp.ratio.setValueAtTime(6, now);
+  comp.attack.setValueAtTime(0.003, now);
+  comp.release.setValueAtTime(0.12, now);
+  comp.connect(audioCtx.destination);
+
+  const guitarWave = hasOverdrive ? null : getGuitarWave(audioCtx);
+
   tabColumns.forEach((col, i) => {
-    const t = now + (tabTimings[i] !== undefined ? tabTimings[i] : i * 0.15);
+    const colT = now + normTimings[i];
+
+    // Duration = gap to next onset (capped at 1.5 s), used for note decay
+    const nextT = i + 1 < normTimings.length ? normTimings[i + 1] : normTimings[i] + 0.5;
+    const noteDur = Math.min(Math.max(nextT - normTimings[i], 0.08), 1.5);
 
     Object.entries(col).forEach(([str, fret]) => {
       if (fret === "-" || !OPEN_MIDI[str]) return;
@@ -287,44 +320,56 @@ function startPlayback() {
 
       const midi = OPEN_MIDI[str] + fretNum;
       const freq = midiToFreq(midi);
+      const decayEnd = colT + noteDur + 0.15;
 
       const osc    = audioCtx.createOscillator();
-      const gain   = audioCtx.createGain();
-      const filter = audioCtx.createBiquadFilter();
+      const envGain = audioCtx.createGain();
+      const filter  = audioCtx.createBiquadFilter();
 
-      osc.type = "sawtooth";
       osc.frequency.value = freq;
 
-      filter.type = "lowpass";
-      filter.frequency.value = hasOverdrive ? 4500 : 2200;
-      filter.Q.value = 1.5;
-
-      // ADSR
-      gain.gain.setValueAtTime(0, t);
-      gain.gain.linearRampToValueAtTime(0.18, t + 0.012);
-      gain.gain.exponentialRampToValueAtTime(0.07, t + 0.09);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
-
       if (hasOverdrive) {
+        // Sawtooth → heavy clip → narrow bandpass (amp cabinet sim)
+        osc.type = "sawtooth";
         const dist = audioCtx.createWaveShaper();
-        dist.curve = makeDistortionCurve(180);
+        dist.curve = makeDistortionCurve(400);
         dist.oversample = "4x";
+
+        filter.type = "bandpass";
+        filter.frequency.value = 1000;
+        filter.Q.value = 0.6;
+
+        envGain.gain.setValueAtTime(0,    colT);
+        envGain.gain.linearRampToValueAtTime(0.20, colT + 0.004);
+        envGain.gain.setValueAtTime(       0.20, colT + 0.004);
+        envGain.gain.exponentialRampToValueAtTime(0.001, decayEnd);
+
         osc.connect(dist);
         dist.connect(filter);
       } else {
+        // Guitar-harmonic PeriodicWave → lowpass (body resonance)
+        osc.setPeriodicWave(guitarWave);
+        filter.type = "lowpass";
+        filter.frequency.value = 2800;
+        filter.Q.value = 0.5;
+
+        envGain.gain.setValueAtTime(0,    colT);
+        envGain.gain.linearRampToValueAtTime(0.22, colT + 0.006);  // pluck attack
+        envGain.gain.exponentialRampToValueAtTime(0.06, colT + 0.12);
+        envGain.gain.exponentialRampToValueAtTime(0.001, decayEnd);
+
         osc.connect(filter);
       }
 
-      filter.connect(gain);
-      gain.connect(audioCtx.destination);
+      filter.connect(envGain);
+      envGain.connect(comp);
 
-      osc.start(t);
-      osc.stop(t + 0.6);
+      osc.start(colT);
+      osc.stop(decayEnd + 0.05);
       playNodes.push(osc);
     });
   });
 
-  // Animate cursor + column highlight
   playBtn.classList.add("hidden");
   stopBtn.classList.remove("hidden");
   animatePlayback();
@@ -336,14 +381,15 @@ function animatePlayback() {
     const elapsed = audioCtx.currentTime - playStart;
     if (elapsed >= playDuration) { stopPlayback(); return; }
 
-    // Move timeline cursor
-    const pct = Math.min(elapsed / playDuration * 100, 100);
-    playCursor.style.left = pct + "%";
+    // Cursor uses normalised time
+    playCursor.style.left = Math.min(elapsed / playDuration * 100, 100) + "%";
 
-    // Highlight current column
-    const activeIdx = tabTimings.reduce((best, t, i) => {
-      return t <= elapsed ? i : best;
-    }, 0);
+    // Find the last column whose normalised timestamp ≤ elapsed
+    let activeIdx = 0;
+    for (let i = 0; i < normTimings.length; i++) {
+      if (normTimings[i] <= elapsed) activeIdx = i;
+      else break;
+    }
     highlightCol(activeIdx);
 
     playRaf = requestAnimationFrame(tick);

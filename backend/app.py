@@ -197,36 +197,45 @@ def detect_overdrive(wav_path: Path) -> dict:
     if len(y) == 0:
         return {"detected": False, "level": "Clean", "score": 0.0}
 
-    # Spectral flatness: 0 = pure tone, 1 = white noise; distortion → higher
+    # 1. Spectral flatness: pure tone → 0, white noise → 1; distortion pushes toward noise
     flatness = librosa.feature.spectral_flatness(y=y)
-    mean_flatness = float(np.mean(flatness))
+    mean_flatness = float(np.mean(flatness))  # clean ~0.005–0.05, distorted ~0.05–0.4
 
-    # Zero-crossing rate: clipping adds high-freq content → more ZC
+    # 2. Zero-crossing rate: clipping saturates the waveform → more zero crossings
     zcr = librosa.feature.zero_crossing_rate(y)
-    mean_zcr = float(np.mean(zcr))
+    mean_zcr = float(np.mean(zcr))  # clean ~0.04–0.10, distorted ~0.10–0.30
 
-    # Hard clipping ratio: overdriven signal spends more time at peak
-    peak = float(np.max(np.abs(y))) or 1.0
-    clip_ratio = float(np.mean(np.abs(y) > 0.80 * peak))
+    # 3. Crest factor (peak-to-RMS): distortion compresses dynamics → lower crest
+    rms = float(np.sqrt(np.mean(y ** 2))) + 1e-8
+    peak = float(np.max(np.abs(y))) + 1e-8
+    crest = peak / rms  # clean guitar ~8–20, overdriven ~2–5
 
-    # Weighted score
-    score = (
-        min(mean_flatness / 0.25, 3.0) * 0.5 +
-        min(mean_zcr / 0.12, 3.0) * 0.3 +
-        min(clip_ratio / 0.03, 3.0) * 0.2
-    )
+    # 4. High-freq energy ratio: distortion generates strong harmonics above 1 kHz
+    stft = np.abs(librosa.stft(y, n_fft=2048))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    lo_e = stft[freqs < 800].mean() + 1e-8
+    hi_e = stft[(freqs >= 800) & (freqs < 8000)].mean() + 1e-8
+    hi_ratio = hi_e / lo_e  # clean ~0.1–0.25, distorted ~0.3–0.9
 
-    if score >= 2.0:
+    # Normalise each feature into a 0-3 contribution (higher = more distortion)
+    s_flat  = min(mean_flatness / 0.08,  3.0)   # saturates at 0.08 flatness
+    s_zcr   = min(mean_zcr   / 0.10,  3.0)   # saturates at ZCR 0.10
+    s_crest = min(max(0, (8 - crest) / 5), 3.0)  # 0 when crest≥8, 3 when crest≤3
+    s_hi    = min(hi_ratio / 0.25, 3.0)       # saturates at ratio 0.25
+
+    score = s_flat * 0.30 + s_zcr * 0.20 + s_crest * 0.30 + s_hi * 0.20
+
+    if score >= 1.8:
         level = "Heavy"
-    elif score >= 1.3:
+    elif score >= 1.1:
         level = "Medium"
-    elif score >= 0.8:
+    elif score >= 0.5:
         level = "Light"
     else:
         level = "Clean"
 
     return {
-        "detected": score >= 0.8,
+        "detected": score >= 0.5,
         "level": level,
         "score": round(score, 3),
     }
@@ -264,50 +273,102 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    """Transcribe notes using librosa's probabilistic YIN (pyin) pitch tracker."""
+    """Polyphonic guitar transcription: onset detection + CQT peak picking.
+
+    pyin is monophonic (single note only) — useless for chords and distorted
+    guitar.  This approach detects onsets (chord strikes / note attacks) and at
+    each onset finds ALL significant frequency peaks in the CQT spectrum, giving
+    us chord detection and much better accuracy on distorted signals.
+    """
     import librosa
     import numpy as np
 
     y, sr = librosa.load(str(wav_path), mono=True)
-
-    # pyin gives confident per-frame fundamental frequency estimates
     hop = 512
-    f0, voiced_flag, voiced_probs = librosa.pyin(
-        y, sr=sr,
-        fmin=librosa.note_to_hz("E2"),   # lowest open guitar string
-        fmax=librosa.note_to_hz("E6"),   # highest practical fret
-        hop_length=hop,
+
+    # ── CQT covering full guitar range (E2 MIDI-40 → 5 octaves) ─────────────
+    fmin = librosa.note_to_hz("E2")   # 82.4 Hz, MIDI 40
+    n_bins = 60                        # 5 octaves × 12 bins/oct → up to MIDI 100
+    C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop, fmin=fmin,
+                             n_bins=n_bins, bins_per_octave=12))
+
+    # ── Onset detection on CQT-derived spectral flux ──────────────────────────
+    onset_env = librosa.onset.onset_strength(
+        S=librosa.amplitude_to_db(C, ref=np.max),
+        sr=sr, hop_length=hop,
     )
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset_env, sr=sr, hop_length=hop,
+        backtrack=True, units="frames",
+        pre_max=3, post_max=3, pre_avg=5, post_avg=5,
+        delta=0.25, wait=3,
+    )
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
-    times = librosa.times_like(f0, sr=sr, hop_length=hop)
+    if len(onset_times) == 0:
+        return []
+
     notes = []
-    in_note = False
-    note_start = 0.0
-    note_midi = 0
 
-    for i, (t, freq, voiced) in enumerate(zip(times, f0, voiced_flag)):
-        if voiced and freq is not None and not np.isnan(freq):
-            midi = int(round(librosa.hz_to_midi(freq)))
-            midi = max(40, min(88, midi))  # clamp to guitar range
-            if not in_note:
-                in_note = True
-                note_start = float(t)
-                note_midi = midi
-            elif midi != note_midi:
-                # pitch changed — close old note, open new one
-                duration = float(t) - note_start
-                if duration >= 0.05:
-                    notes.append({"start": round(note_start, 3), "end": round(float(t), 3),
-                                  "pitch": note_midi, "velocity": 80})
-                note_start = float(t)
-                note_midi = midi
+    for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
+        # Short window right after the onset to measure attack spectrum
+        win_end = min(frame + 6, C.shape[1])
+        if frame >= C.shape[1]:
+            continue
+
+        mag = C[:, frame:win_end].max(axis=1)   # peak magnitude per pitch bin
+
+        # Find local spectral peaks (must be locally maximal)
+        peaks = []
+        for b in range(1, len(mag) - 1):
+            if mag[b] > mag[b - 1] and mag[b] >= mag[b + 1]:
+                peaks.append((b, float(mag[b])))
+        if not peaks:
+            continue
+
+        # Keep only peaks above 25 % of the strongest peak in this window
+        max_mag = max(m for _, m in peaks)
+        if max_mag == 0:
+            continue
+        peaks = [(b, m) for b, m in peaks if m >= 0.25 * max_mag]
+
+        # Suppress harmonics: if bin b ≈ N × bin a (N = 2,3,4) and a is at
+        # least 40 % as loud, bin b is a harmonic — remove it to avoid
+        # duplicating the fundamental at its octave.
+        def is_harmonic(b_hi, kept):
+            f_hi = fmin * 2 ** (b_hi / 12)
+            for b_lo, m_lo in kept:
+                f_lo = fmin * 2 ** (b_lo / 12)
+                for h in [2, 3, 4]:
+                    if abs(f_hi / f_lo - h) < 0.09 and m_lo >= 0.40 * mag[b_hi]:
+                        return True
+            return False
+
+        peaks.sort(key=lambda x: -x[1])   # strongest first
+        kept = []
+        for b, m in peaks:
+            if not is_harmonic(b, kept):
+                kept.append((b, m))
+            if len(kept) >= 6:             # at most one note per string
+                break
+
+        # Duration = gap to next onset, capped at 2 s
+        if i + 1 < len(onset_times):
+            dur = min(onset_times[i + 1] - onset_t, 2.0)
         else:
-            if in_note:
-                duration = float(t) - note_start
-                if duration >= 0.05:
-                    notes.append({"start": round(note_start, 3), "end": round(float(t), 3),
-                                  "pitch": note_midi, "velocity": 80})
-                in_note = False
+            dur = 0.5
+        dur = max(dur, 0.05)
+
+        for b, _ in kept:
+            midi = 40 + b                  # E2 (bin 0) = MIDI 40
+            if not (40 <= midi <= 88):
+                continue
+            notes.append({
+                "start":    round(onset_t, 3),
+                "end":      round(onset_t + dur, 3),
+                "pitch":    int(midi),
+                "velocity": 80,
+            })
 
     return notes
 
