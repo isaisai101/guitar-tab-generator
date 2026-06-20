@@ -360,134 +360,55 @@ def detect_tuning(wav_path: Path):
 
 
 def run_basic_pitch(job_id, wav_path: Path):
-    """Polyphonic guitar transcription: additive salience + onset detection.
+    """Polyphonic pitch detection using Spotify's Basic Pitch neural network.
 
-    Additive salience lifts genuine fundamentals above their harmonics.
-    Sub-harmonic ghost suppression in is_harmonic() stops "open E4" from
-    creating false detections at E2/E3 (which share E4 as a harmonic).
+    Replaces the hand-rolled CQT+salience approach which could not handle:
+      - Distorted guitar: harmonic spreading fills every CQT bin uniformly,
+        making spectral peaks meaningless for fundamental detection.
+      - Fast note sequences: onset-gated peak-picking misses notes when two
+        onsets are too close for the filter to resolve them separately.
+
+    Basic Pitch uses a CNN trained on real polyphonic audio and outputs
+    frame-level note probabilities directly, without needing manual thresholds.
+    Uses the ONNX backend (onnxruntime) — no TensorFlow required.
     """
-    import librosa
-    import numpy as np
-    from scipy.signal import find_peaks
+    import warnings
+    import logging
+    warnings.filterwarnings("ignore")
+    logging.disable(logging.WARNING)
 
-    y, sr = librosa.load(str(wav_path), mono=True, duration=90.0)
-    hop = 512
+    from basic_pitch.inference import predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH
 
-    fmin = librosa.note_to_hz("D2")   # 73.4 Hz — MIDI 38, covers Drop D
-    FMIN_MIDI = 38
-    n_bins = 62
-    C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop,
-                             fmin=fmin, n_bins=n_bins, bins_per_octave=12))
-
-    # ── Additive harmonic salience ────────────────────────────────────────────
-    # sal[b] = C[b] + 0.5·C[b+12] + 0.33·C[b+19] + 0.25·C[b+24]
-    # Bins 12, 19, 24 are the 2nd, 3rd, 4th harmonics in 12-tone CQT.
-    # Genuine fundamentals accumulate energy from their harmonics → high sal.
-    # Random overtones lack their OWN harmonics → low sal.
-    sal = C.astype(np.float32).copy()
-    for off, w in [(12, 0.50), (19, 0.33), (24, 0.25)]:
-        if off < n_bins:
-            sal[:n_bins - off, :] += w * C[off:, :]
-
-    # Global noise floor at 30th percentile.
-    # For distorted guitar (Deftones), every CQT bin has energy from harmonic
-    # spreading, so this percentile is high. We use it only as one component
-    # of a two-level threshold; per-onset local noise is the primary gate.
-    g_noise = float(np.percentile(sal, 30))
-
-    # ── Onset detection on raw CQT ────────────────────────────────────────────
-    onset_env = librosa.onset.onset_strength(
-        S=librosa.amplitude_to_db(C, ref=np.max),
-        sr=sr, hop_length=hop,
+    # Guitar range: D2 (73.4 Hz, MIDI 38, covers Drop D) → E6 (1318.5 Hz)
+    _, _, note_events = predict(
+        str(wav_path),
+        ICASSP_2022_MODEL_PATH,
+        onset_threshold=0.5,
+        frame_threshold=0.3,
+        minimum_note_length=58,        # ms — filters sub-60ms glitches
+        minimum_frequency=73.4,        # D2
+        maximum_frequency=1318.5,      # E6
+        multiple_pitch_bends=False,
+        melodia_trick=True,
     )
-    onset_frames = librosa.onset.onset_detect(
-        onset_envelope=onset_env, sr=sr, hop_length=hop,
-        backtrack=True, units="frames",
-        pre_max=3, post_max=3, pre_avg=7, post_avg=7,
-        delta=0.25, wait=7,   # lower delta → catches onsets in noisy/distorted stems
-    )
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
-
-    if len(onset_times) == 0:
-        return []
 
     notes = []
+    for event in note_events:
+        start_t   = float(event[0])
+        end_t     = float(event[1])
+        pitch_midi = int(round(float(event[2])))
+        amplitude  = float(event[3]) if len(event) > 3 else 0.7
 
-    for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
-        win_end = min(frame + 8, sal.shape[1])
-        if frame >= sal.shape[1]:
+        if not (38 <= pitch_midi <= 88):
             continue
 
-        mag = sal[:, frame:win_end].mean(axis=1)
-        peak_mag = float(mag.max())
-
-        # Per-onset local noise: 25th percentile of THIS onset's salience window.
-        # For clean guitar: low (most bins quiet, real note sticks out sharply).
-        # For distorted guitar: higher (distortion fills all bins), but real notes
-        # still create a relative peak above their local surroundings.
-        l_noise = float(np.percentile(mag, 25))
-
-        # Two-level pre-filter: pass if peak clears EITHER the global OR local floor.
-        # The max() means a strongly present note passes even if the other condition
-        # would reject it — handles both quiet-recording and high-noise scenarios.
-        if peak_mag < max(g_noise * 1.5, l_noise * 1.8):
-            continue
-
-        # find_peaks with thresholds anchored to the local noise floor so that
-        # distorted-guitar peaks (which ride on top of a noisy baseline) are not
-        # filtered by an overly high prominence threshold.
-        prom = max(l_noise * 0.5, g_noise * 0.25)
-        peaks, _ = find_peaks(
-            mag,
-            height=max(l_noise * 1.3, g_noise * 0.7),
-            distance=2,
-            prominence=prom,
-        )
-
-        # Fallback: if no sharp peaks found but onset passed the pre-filter,
-        # take the most salient bin. Covers broad salience humps in distorted audio
-        # and prevents timing gaps in the tab from skipped onsets.
-        if len(peaks) == 0:
-            peaks = np.array([int(np.argmax(mag))])
-
-        # Top 2 candidates: single note or power chord (root + fifth)
-        peaks = peaks[np.argsort(mag[peaks])[::-1][:2]]
-
-        raw = C[:, frame:win_end].mean(axis=1)
-
-        def is_harmonic(b_test, kept):
-            f_t = fmin * 2 ** (b_test / 12)
-            for bk in kept:
-                f_k = fmin * 2 ** (bk / 12)
-                for h in [2, 3, 4]:
-                    if abs(f_t / f_k - h) < 0.09 and raw[bk] >= 0.25 * raw[b_test]:
-                        return True   # b_test is an overtone of bk
-                    if abs(f_k / f_t - h) < 0.09 and raw[b_test] < 0.45 * raw[bk]:
-                        return True   # b_test is a ghost sub-harmonic
-            return False
-
-        kept = []
-        for b in peaks:
-            if not is_harmonic(b, kept):
-                kept.append(int(b))
-
-        # Harmonic suppression removed everything → keep the top candidate
-        if not kept:
-            kept = [int(peaks[0])]
-
-        dur = float(onset_times[i + 1] - onset_t) if i + 1 < len(onset_times) else 0.5
-        dur = max(min(dur, 2.0), 0.06)
-
-        for b in kept:
-            midi = FMIN_MIDI + b
-            if not (38 <= midi <= 88):
-                continue
-            notes.append({
-                "start":    round(float(onset_t), 3),
-                "end":      round(float(onset_t) + dur, 3),
-                "pitch":    midi,
-                "velocity": 80,
-            })
+        notes.append({
+            "start":    round(start_t, 3),
+            "end":      round(end_t,   3),
+            "pitch":    pitch_midi,
+            "velocity": int(min(127, max(40, amplitude * 127))),
+        })
 
     return notes
 

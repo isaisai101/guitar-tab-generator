@@ -7,3 +7,8 @@ scipy==1.13.1
 yt-dlp
 soundfile==0.12.1
 werkzeug==3.0.3
+basic-pitch==0.4.0
+onnxruntime
+pretty_midi
+mir_eval
+resampy==0.4.2
