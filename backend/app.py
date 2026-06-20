@@ -389,8 +389,11 @@ def run_basic_pitch(job_id, wav_path: Path):
         if off < n_bins:
             sal[:n_bins - off, :] += w * C[off:, :]
 
-    # Noise floor: 40th percentile of salience across the whole stem.
-    noise = float(np.percentile(sal, 40))
+    # Global noise floor at 30th percentile.
+    # For distorted guitar (Deftones), every CQT bin has energy from harmonic
+    # spreading, so this percentile is high. We use it only as one component
+    # of a two-level threshold; per-onset local noise is the primary gate.
+    g_noise = float(np.percentile(sal, 30))
 
     # ── Onset detection on raw CQT ────────────────────────────────────────────
     onset_env = librosa.onset.onset_strength(
@@ -401,7 +404,7 @@ def run_basic_pitch(job_id, wav_path: Path):
         onset_envelope=onset_env, sr=sr, hop_length=hop,
         backtrack=True, units="frames",
         pre_max=3, post_max=3, pre_avg=7, post_avg=7,
-        delta=0.35, wait=8,
+        delta=0.25, wait=7,   # lower delta → catches onsets in noisy/distorted stems
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
@@ -415,32 +418,41 @@ def run_basic_pitch(job_id, wav_path: Path):
         if frame >= sal.shape[1]:
             continue
 
-        mag = sal[:, frame:win_end].mean(axis=1)   # average salience over 8 frames
+        mag = sal[:, frame:win_end].mean(axis=1)
         peak_mag = float(mag.max())
 
-        # Require signal at least 2.5× the noise floor to filter silent onsets
-        if peak_mag < noise * 2.5:
+        # Per-onset local noise: 25th percentile of THIS onset's salience window.
+        # For clean guitar: low (most bins quiet, real note sticks out sharply).
+        # For distorted guitar: higher (distortion fills all bins), but real notes
+        # still create a relative peak above their local surroundings.
+        l_noise = float(np.percentile(mag, 25))
+
+        # Two-level pre-filter: pass if peak clears EITHER the global OR local floor.
+        # The max() means a strongly present note passes even if the other condition
+        # would reject it — handles both quiet-recording and high-noise scenarios.
+        if peak_mag < max(g_noise * 1.5, l_noise * 1.8):
             continue
 
-        # scipy find_peaks with prominence: only genuine spectral peaks survive
+        # find_peaks with thresholds anchored to the local noise floor so that
+        # distorted-guitar peaks (which ride on top of a noisy baseline) are not
+        # filtered by an overly high prominence threshold.
+        prom = max(l_noise * 0.5, g_noise * 0.25)
         peaks, _ = find_peaks(
             mag,
-            height=max(noise * 1.2, peak_mag * 0.22),
+            height=max(l_noise * 1.3, g_noise * 0.7),
             distance=2,
-            prominence=noise * 0.6,
+            prominence=prom,
         )
+
+        # Fallback: if no sharp peaks found but onset passed the pre-filter,
+        # take the most salient bin. Covers broad salience humps in distorted audio
+        # and prevents timing gaps in the tab from skipped onsets.
         if len(peaks) == 0:
-            continue
+            peaks = np.array([int(np.argmax(mag))])
 
         # Top 2 candidates: single note or power chord (root + fifth)
         peaks = peaks[np.argsort(mag[peaks])[::-1][:2]]
 
-        # Harmonic suppression uses RAW CQT magnitudes (not salience).
-        # Suppresses:
-        #   a) b_test is an overtone of a kept bin (frequency ratio 2, 3, or 4)
-        #   b) b_test is a ghost sub-harmonic — it was only "found" because a
-        #      real note at b_kept is one of b_test's harmonics, and b_test
-        #      itself has very little raw energy.
         raw = C[:, frame:win_end].mean(axis=1)
 
         def is_harmonic(b_test, kept):
@@ -451,13 +463,17 @@ def run_basic_pitch(job_id, wav_path: Path):
                     if abs(f_t / f_k - h) < 0.09 and raw[bk] >= 0.25 * raw[b_test]:
                         return True   # b_test is an overtone of bk
                     if abs(f_k / f_t - h) < 0.09 and raw[b_test] < 0.45 * raw[bk]:
-                        return True   # b_test is a ghost (bk is b_test's harmonic)
+                        return True   # b_test is a ghost sub-harmonic
             return False
 
         kept = []
         for b in peaks:
             if not is_harmonic(b, kept):
                 kept.append(int(b))
+
+        # Harmonic suppression removed everything → keep the top candidate
+        if not kept:
+            kept = [int(peaks[0])]
 
         dur = float(onset_times[i + 1] - onset_t) if i + 1 < len(onset_times) else 0.5
         dur = max(min(dur, 2.0), 0.06)
