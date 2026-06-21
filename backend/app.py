@@ -1,12 +1,24 @@
 import os
+import sys
 import uuid
 import json
+import shutil
 import subprocess
 import threading
 import traceback
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+
+# Resolved absolute path to ffmpeg.exe, filled in by _ensure_ffmpeg_in_path().
+# Used so subprocess calls don't depend on PATH (which the launching process
+# may not have populated with the winget user-PATH entry).
+FFMPEG_EXE = None
+
+# Whether a JavaScript runtime (node) is available. Recent YouTube changes make
+# yt-dlp require a JS runtime to extract audio formats; without it downloads
+# fail with HTTP 403. Filled in by _ensure_node().
+HAS_NODE = False
 
 # Patch torchaudio.save to use soundfile — torchcodec requires FFmpeg shared
 # DLLs that are not reliably present on Windows. soundfile works everywhere.
@@ -28,26 +40,58 @@ _patch_torchaudio()
 
 
 def _ensure_ffmpeg_in_path():
-    """Add the winget-installed ffmpeg to PATH if it isn't already findable.
+    """Locate ffmpeg and make it usable by both PATH lookups and explicit paths.
 
     On Windows, winget installs ffmpeg into the USER PATH, not MACHINE PATH.
-    Flask subprocesses (yt-dlp, ffmpeg crop) inherit only the environment of
-    the process that launched Flask, which may not include the user PATH.
+    A process launched without loading the user environment (e.g. via a bare
+    python.exe path) won't have ffmpeg on PATH, so subprocesses can't find it.
+    We resolve the absolute ffmpeg.exe, stash it in FFMPEG_EXE, and also prepend
+    its directory to PATH so tools that look it up by name still work.
     """
-    import shutil, glob, os
-    if shutil.which("ffmpeg"):
+    global FFMPEG_EXE
+    import glob
+
+    found = shutil.which("ffmpeg")
+    if found:
+        FFMPEG_EXE = found
         return
+
     base = os.path.expandvars("%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages")
     for exe in glob.glob(os.path.join(base, "Gyan.FFmpeg*", "**", "ffmpeg.exe"),
                          recursive=True):
+        FFMPEG_EXE = exe
         bin_dir = os.path.dirname(exe)
         os.environ["PATH"] = bin_dir + ";" + os.environ.get("PATH", "")
-        print(f"[startup] ffmpeg added to PATH: {bin_dir}")
+        print(f"[startup] ffmpeg found: {exe}")
         return
     print("[startup] WARNING: ffmpeg not found — YouTube downloads may fail")
 
 
+def _ensure_node():
+    """Find a node JS runtime and make it discoverable for yt-dlp.
+
+    YouTube extraction now requires a JS runtime; yt-dlp finds `node` on PATH.
+    We prepend node's directory to PATH (the standard install dir is on the
+    machine PATH, but a process launched without it would otherwise miss it).
+    """
+    global HAS_NODE
+    found = shutil.which("node")
+    if not found:
+        default = r"C:\Program Files\nodejs\node.exe"
+        if os.path.exists(default):
+            found = default
+    if found:
+        HAS_NODE = True
+        node_dir = os.path.dirname(found)
+        if node_dir.lower() not in os.environ.get("PATH", "").lower():
+            os.environ["PATH"] = node_dir + ";" + os.environ.get("PATH", "")
+        print(f"[startup] node JS runtime found: {found}")
+    else:
+        print("[startup] WARNING: node not found — YouTube downloads may 403")
+
+
 _ensure_ffmpeg_in_path()
+_ensure_node()
 
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
@@ -138,17 +182,29 @@ def process_youtube(job_id, url):
         url = _clean_yt_url(url)
         set_job(job_id, status="running", progress=5, message="Downloading from YouTube…")
         out_path = UPLOAD_DIR / f"{job_id}.%(ext)s"
+        # Invoke yt-dlp as a module of THIS interpreter (sys.executable) so it's
+        # found regardless of PATH — a bare "yt-dlp" fails with WinError 2 when
+        # the venv's Scripts dir isn't on PATH.
         cmd = [
-            "yt-dlp", "-x", "--audio-format", "wav",
+            sys.executable, "-m", "yt_dlp",
+            "-x", "--audio-format", "wav",
             "--audio-quality", "0",
             "--no-playlist",
             "-o", str(out_path),
-            url
         ]
+        if HAS_NODE:
+            # YouTube now requires a JS runtime; without it yt-dlp gets HTTP 403.
+            cmd += ["--js-runtimes", "node"]
+        if FFMPEG_EXE:
+            # yt-dlp needs ffmpeg to extract/convert to wav; point it at the
+            # ffmpeg directory so it doesn't rely on PATH either.
+            cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG_EXE)]
+        cmd.append(url)
         result = subprocess.run(cmd, capture_output=True, timeout=300)
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"yt-dlp failed:\n{stderr[-600:]}")
+            err = stderr[-600:] if stderr.strip() else "yt-dlp returned no output (is it installed in this environment?)"
+            raise RuntimeError(f"yt-dlp failed:\n{err}")
         matches = list(UPLOAD_DIR.glob(f"{job_id}.*"))
         if not matches:
             raise RuntimeError("yt-dlp produced no output file")
@@ -169,9 +225,10 @@ def _crop_to_90s(src: Path) -> Path:
     isn't in PATH or the file is already short.
     """
     out = UPLOAD_DIR / f"{src.stem}_90s.wav"
+    ffmpeg = FFMPEG_EXE or "ffmpeg"
     try:
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src),
+            [ffmpeg, "-y", "-i", str(src),
              "-t", "90",
              "-acodec", "pcm_s16le", "-ar", "44100",
              str(out)],
