@@ -268,12 +268,64 @@ def run_demucs(job_id, src: Path) -> Path:
         _stop.set()
 
     stem_root = out_root / "htdemucs_6s" / src.stem
-    guitar_path = stem_root / "guitar.wav"
-    if not guitar_path.exists():
-        guitar_path = stem_root / "other.wav"
-    if not guitar_path.exists():
+    return _select_guitar_audio(stem_root)
+
+
+def _select_guitar_audio(stem_root: Path) -> Path:
+    """Pick the best audio to transcribe from Demucs' 6 stems.
+
+    htdemucs_6s separates: drums, bass, other, vocals, guitar, piano.
+    Its "guitar" stem is trained on electric-guitar-in-a-band; for acoustic /
+    fingerstyle recordings most of the guitar leaks into "other", leaving the
+    guitar stem nearly silent. Transcribing that empty stem is why clean songs
+    produced garbage.
+
+    Strategy: compare RMS energy of the guitar stem vs the other stem. If the
+    guitar stem is weak relative to other, sum guitar+other so we don't lose
+    the acoustic guitar content. Drums/bass/vocals/piano are excluded to keep
+    the signal guitar-focused.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    guitar_p = stem_root / "guitar.wav"
+    other_p  = stem_root / "other.wav"
+
+    if not guitar_p.exists():
+        if other_p.exists():
+            return other_p
         raise RuntimeError(f"Could not find guitar stem in {stem_root}")
-    return guitar_path
+
+    def _rms(p: Path) -> float:
+        try:
+            data, _ = sf.read(str(p))
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+            return float(np.sqrt(np.mean(data ** 2))) if len(data) else 0.0
+        except Exception:
+            return 0.0
+
+    g_rms = _rms(guitar_p)
+    o_rms = _rms(other_p) if other_p.exists() else 0.0
+
+    # Guitar stem is weak (acoustic leaked into "other") → combine the two.
+    if other_p.exists() and (g_rms < 0.01 or g_rms < 0.5 * o_rms):
+        try:
+            g, sr = sf.read(str(guitar_p))
+            o, _  = sf.read(str(other_p))
+            if g.ndim > 1: g = g.mean(axis=1)
+            if o.ndim > 1: o = o.mean(axis=1)
+            n = min(len(g), len(o))
+            combined = g[:n] + o[:n]
+            peak = float(np.max(np.abs(combined))) or 1.0
+            combined = combined / peak * 0.97   # normalise to avoid clipping
+            out = stem_root / "guitar_plus_other.wav"
+            sf.write(str(out), combined, sr)
+            return out
+        except Exception:
+            return guitar_p
+
+    return guitar_p
 
 
 def detect_overdrive(wav_path: Path) -> dict:
@@ -359,186 +411,157 @@ def detect_tuning(wav_path: Path):
     return best[0], best[1]
 
 
-def run_basic_pitch(job_id, wav_path: Path):
-    """Guitar pitch detection: pYIN (time-domain autocorrelation) + power-chord check.
+def transcribe_notes(job_id, wav_path: Path):
+    """Polyphonic guitar transcription with Spotify's Basic Pitch (ONNX backend).
 
-    WHY pYIN instead of CQT salience or Basic Pitch:
-
-    Distortion preserves the FUNDAMENTAL PERIOD of a note — it just adds
-    harmonics at integer multiples. pYIN finds periodicity in the time domain
-    (Cumulative Mean Normalized Difference Function) and is therefore robust
-    to any amount of distortion. CQT peak-picking and neural models trained on
-    clean audio both fail because they look at the frequency domain, where
-    distortion creates a flat wall of harmonic energy across all bins.
-
-    For a distorted E5 power chord (E2 + B2), the combined waveform has the
-    period of E2 (root), so pYIN correctly returns E2 even through a
-    WaveShaper-style guitar distortion.
-
-    After detecting the root via pYIN, we check whether the fifth (+7 semitones)
-    has significant CQT energy at the onset — if yes, it's a power chord and
-    we emit both notes. Single-note riffs only produce one note per onset.
+    Basic Pitch is a CNN trained on real polyphonic recordings (including
+    GuitarSet — acoustic guitar). It outputs note events with pitch, start,
+    end and amplitude, and natively detects CHORDS (multiple simultaneous
+    notes), unlike a monophonic tracker. We then filter spurious notes by
+    amplitude and clamp to the guitar range.
     """
-    import librosa
-    import numpy as np
+    import warnings, logging
+    warnings.filterwarnings("ignore")
+    logging.disable(logging.WARNING)
 
-    y, sr = librosa.load(str(wav_path), mono=True, duration=90.0)
-    hop = 512
+    from basic_pitch.inference import predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH
 
-    FMIN_HZ = librosa.note_to_hz("D2")   # 73.4 Hz — MIDI 38, covers Drop D
-    FMAX_HZ = librosa.note_to_hz("A5")   # 880 Hz — MIDI 81, covers high frets
-
-    # ── CQT — used only for onset detection and fifth-energy check ────────────
-    C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop,
-                            fmin=FMIN_HZ, n_bins=62, bins_per_octave=12))
-
-    onset_env = librosa.onset.onset_strength(
-        S=librosa.amplitude_to_db(C, ref=np.max), sr=sr, hop_length=hop,
+    # onset/frame thresholds tuned for guitar:
+    #  - lower onset_threshold catches soft fingerpicked notes
+    #  - minimum_note_length filters sub-90ms blips (string noise, artifacts)
+    _, _, note_events = predict(
+        str(wav_path),
+        ICASSP_2022_MODEL_PATH,
+        onset_threshold=0.45,
+        frame_threshold=0.30,
+        minimum_note_length=90,        # ms
+        minimum_frequency=73.4,        # D2 — covers Drop D / down-tunings
+        maximum_frequency=1318.5,      # E6 — high frets on the high E string
+        multiple_pitch_bends=False,
+        melodia_trick=True,
     )
-    onset_frames = librosa.onset.onset_detect(
-        onset_envelope=onset_env, sr=sr, hop_length=hop,
-        backtrack=True, units="frames",
-        pre_max=3, post_max=3, pre_avg=7, post_avg=7,
-        delta=0.3, wait=6,
-    )
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
-    if len(onset_times) == 0:
+    if not note_events:
         return []
 
-    # ── pYIN — time-domain pitch over the full audio ─────────────────────────
-    # frame_length=2048 ≈ 46ms, gives pitch accuracy of ±0.5 semitones
-    f0_arr, voiced_flag, _ = librosa.pyin(
-        y,
-        fmin=FMIN_HZ,
-        fmax=FMAX_HZ,
-        sr=sr,
-        hop_length=hop,
-        frame_length=2048,
-    )
+    # Amplitude-based spurious-note filter: keep notes whose confidence is at
+    # least 18% of the loudest note. Removes the scattered "random notes" that
+    # come from bleed/reverb without dropping genuine quiet chord tones.
+    amps = [float(ev[3]) for ev in note_events if len(ev) > 3]
+    amp_floor = (max(amps) * 0.18) if amps else 0.0
 
     notes = []
+    for ev in note_events:
+        start_t    = float(ev[0])
+        end_t      = float(ev[1])
+        pitch_midi = int(round(float(ev[2])))
+        amplitude  = float(ev[3]) if len(ev) > 3 else 0.7
 
-    for i, (frame, onset_t) in enumerate(zip(onset_frames, onset_times)):
-        win_end = min(frame + 8, len(f0_arr))
-        if frame >= len(f0_arr):
+        if amplitude < amp_floor:
             continue
-
-        # Take voiced pYIN pitch across 8 frames (~93 ms after onset)
-        f0_win     = f0_arr[frame:win_end]
-        voiced_win = voiced_flag[frame:win_end]
-        valid_f0   = f0_win[voiced_win & ~np.isnan(f0_win)]
-
-        if len(valid_f0) == 0:
+        if not (38 <= pitch_midi <= 88):      # E2 (low, Drop D) … E6
             continue
-
-        root_hz  = float(np.median(valid_f0))
-        root_midi = int(round(librosa.hz_to_midi(root_hz)))
-
-        if not (38 <= root_midi <= 81):
-            continue
-
-        dur = float(onset_times[i + 1] - onset_t) if i + 1 < len(onset_times) else 0.5
-        dur = max(min(dur, 2.0), 0.06)
 
         notes.append({
-            "start":    round(float(onset_t), 3),
-            "end":      round(float(onset_t) + dur, 3),
-            "pitch":    root_midi,
-            "velocity": 80,
+            "start":    round(start_t, 3),
+            "end":      round(end_t,   3),
+            "pitch":    pitch_midi,
+            "velocity": int(min(127, max(45, amplitude * 127))),
         })
 
-        # ── Power-chord fifth detection ────────────────────────────────────
-        # The fifth is root + 7 semitones (e.g. E2 + B2).
-        # B2 is NOT a harmonic of E2 (harmonics are 2x, 3x, … not 1.5x),
-        # so CQT energy at the fifth bin comes only from the fifth actually
-        # being played — not from the root's own harmonic series.
-        fifth_midi = root_midi + 7
-        if 38 <= fifth_midi <= 88:
-            root_bin  = int(round(12 * np.log2(root_hz / FMIN_HZ)))
-            fifth_bin = root_bin + 7
-            win_c     = min(frame + 8, C.shape[1])
-            if 0 <= root_bin < C.shape[0] and fifth_bin < C.shape[0]:
-                root_e  = float(C[root_bin,  frame:win_c].mean())
-                fifth_e = float(C[fifth_bin, frame:win_c].mean())
-                if root_e > 1e-8 and fifth_e / root_e > 0.30:
-                    notes.append({
-                        "start":    round(float(onset_t), 3),
-                        "end":      round(float(onset_t) + dur, 3),
-                        "pitch":    fifth_midi,
-                        "velocity": 72,
-                    })
-
+    notes.sort(key=lambda n: (n["start"], n["pitch"]))
     return notes
 
 
+# Backwards-compatible alias (process_audio still calls run_basic_pitch)
+def run_basic_pitch(job_id, wav_path: Path):
+    return transcribe_notes(job_id, wav_path)
+
+
 def build_tab(notes, open_strings, tuning_name):
-    """Convert MIDI note events → ASCII guitar tab."""
-    # open_strings: list of 6 MIDI notes, index 0 = low E (string 6), index 5 = high e (string 1)
-    STRING_LABELS = ["e", "B", "G", "D", "A", "E"]  # high to low in display
+    """Convert MIDI note events → ASCII guitar tab with chord support.
 
-    def midi_to_tab(midi_pitch):
-        """Return (string_idx_display, fret) where string_idx_display 0=high e."""
-        best = None
-        for i, open_midi in enumerate(open_strings):
-            fret = midi_pitch - open_midi
-            if 0 <= fret <= 24:
-                display_idx = 5 - i  # reverse: index 0 in open_strings = low E = display row 5
-                if best is None or fret < best[1]:
-                    best = (display_idx, fret)
-        return best  # (display_row 0=high_e..5=low_E, fret)
+    open_strings: 6 MIDI notes, index 0 = low E (string 6) … index 5 = high e.
+    Notes that start within CHORD_WINDOW seconds of each other are treated as a
+    chord/strum and assigned to DISTINCT strings (the previous version let a
+    later note overwrite an earlier one on the same string, silently dropping
+    chord tones).
+    """
+    STRING_LABELS = ["e", "B", "G", "D", "A", "E"]  # display order: high → low
+    CHORD_WINDOW = 0.07   # seconds — notes this close = same strum
+    MAX_FRET = 22
 
-    COL_WIDTH = 4
-    COLS_PER_LINE = 16
-    TOTAL_COLS = max(1, len(notes))
-
-    # bucket notes into columns by time
     if not notes:
         return _render_tab_text([], STRING_LABELS, tuning_name), [], []
 
-    duration = notes[-1]["end"] if notes else 1.0
-    duration = max(duration, 0.1)
+    def candidate_strings(midi_pitch):
+        """All playable (open_string_idx, fret) for this pitch, low string first."""
+        out = []
+        for i, open_midi in enumerate(open_strings):   # i: 0=low E … 5=high e
+            fret = midi_pitch - open_midi
+            if 0 <= fret <= MAX_FRET:
+                out.append((i, fret))
+        return out
 
-    columns = []  # list of {string_label: fret_str or "-"}
-    tab_events = []
-
+    # ── Group notes into time columns ────────────────────────────────────────
+    grouped = []          # list of (time, {pitch: velocity})
+    cur_notes, cur_time = {}, None
     for note in notes:
-        result = midi_to_tab(note["pitch"])
-        if result is None:
-            continue
-        disp_row, fret = result
-        col_time = note["start"]
-        tab_events.append({
-            "time": col_time,
-            "string": STRING_LABELS[disp_row],
-            "fret": fret,
-        })
-
-    # Sort by time, group into columns (notes within 0.05s = same column)
-    tab_events.sort(key=lambda e: e["time"])
-    grouped = []  # list of (time, [events])
-    current_group = []
-    current_time = None
-    for ev in tab_events:
-        if current_time is None or abs(ev["time"] - current_time) < 0.05:
-            current_group.append(ev)
-            if current_time is None:
-                current_time = ev["time"]
+        t = note["start"]
+        p, v = note["pitch"], note.get("velocity", 80)
+        if cur_time is None or abs(t - cur_time) <= CHORD_WINDOW:
+            cur_notes[p] = max(cur_notes.get(p, 0), v)
+            if cur_time is None:
+                cur_time = t
         else:
-            grouped.append((current_time, current_group))
-            current_group = [ev]
-            current_time = ev["time"]
-    if current_group:
-        grouped.append((current_time, current_group))
+            grouped.append((cur_time, cur_notes))
+            cur_notes, cur_time = {p: v}, t
+    if cur_notes:
+        grouped.append((cur_time, cur_notes))
+
+    def drop_octave_ghosts(note_vels):
+        """Remove a note at P+12 if it's a weak harmonic of a stronger P.
+        Genuine octave doublings (both struck) survive because both are loud;
+        a harmonic ghost is much quieter than its fundamental."""
+        pitches = set(note_vels)
+        kept = {}
+        for p, v in note_vels.items():
+            if (p - 12) in pitches and v < 0.6 * note_vels[p - 12]:
+                continue   # p is a weak octave-up ghost of p-12
+            kept[p] = v
+        return kept
 
     columns = []
-    timings = []  # seconds timestamp per column for playback
-    for t, group in grouped:
+    timings = []
+    for t, note_vels in grouped:
+        note_vels = drop_octave_ghosts(note_vels)
+        # Keep the 6 loudest if more pitches than strings (compact, real voicing)
+        if len(note_vels) > 6:
+            top = sorted(note_vels.items(), key=lambda kv: -kv[1])[:6]
+            note_vels = dict(top)
+        pitches = list(note_vels)
+
+        # Assign HIGHEST pitch to the HIGHEST available string. This reproduces
+        # standard guitar voicings: bass notes land on bass strings at low frets,
+        # treble notes on treble strings — e.g. C4 E4 G4 C3 E3 → open C major
+        # (x32010) instead of a cluster of fret-15 notes on the low strings.
+        used = set()                       # open_strings indices already taken
         col = {l: "-" for l in STRING_LABELS}
-        for ev in group:
-            col[ev["string"]] = str(ev["fret"])
-        columns.append(col)
-        timings.append(round(t, 3))
+        for pitch in sorted(set(pitches), reverse=True):
+            # candidate strings, highest string (thinnest) first
+            cands = sorted(candidate_strings(pitch), key=lambda c: -c[0])
+            for str_idx, fret in cands:
+                if str_idx not in used:
+                    used.add(str_idx)
+                    display_idx = 5 - str_idx           # low E (idx0) → bottom row
+                    col[STRING_LABELS[display_idx]] = str(fret)
+                    break
+            # If every candidate string is taken, the note can't be voiced
+            # simultaneously on a 6-string guitar — drop it.
+        if any(v != "-" for v in col.values()):
+            columns.append(col)
+            timings.append(round(t, 3))
 
     tab_text = _render_tab_text(columns, STRING_LABELS, tuning_name)
     return tab_text, columns, timings
