@@ -253,23 +253,59 @@ function midiToFreq(midi) {
   return 440 * Math.pow(2, (midi - 69) / 12);
 }
 
-// Soft-clip distortion curve (heavier at higher amount)
+// Soft-clip distortion curve. `amount` ~ drive: keep MODERATE (20-40).
+// The old value of 400 aliased a sawtooth into a harsh crack and pushed the
+// signal so hot the compressor pumped everything down to silence.
 function makeDistortionCurve(amount) {
-  const n = 512, curve = new Float32Array(n);
+  const n = 1024, curve = new Float32Array(n);
+  const k = amount;
   for (let i = 0; i < n; i++) {
     const x = (i * 2) / n - 1;
-    curve[i] = ((Math.PI + amount) * x) / (Math.PI + amount * Math.abs(x));
+    // tanh-style soft clip — smooth, no aliasing crack
+    curve[i] = Math.tanh(k * x) / Math.tanh(k);
   }
   return curve;
 }
 
-// Plucked-string PeriodicWave (approximates decaying guitar harmonics)
+// Gentle brick-wall limiter curve for the master bus — stops chord transients
+// from clicking without audibly distorting normal levels.
+function makeLimiterCurve() {
+  const n = 1024, curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i * 2) / n - 1;
+    curve[i] = Math.tanh(1.6 * x);   // ~unity near 0, soft ceiling near ±1
+  }
+  return curve;
+}
+
+// Plucked-string PeriodicWave. Slightly richer odd-harmonic content gives the
+// woody guitar character (vs the rounder, more "piano/organ" prior spectrum).
 function getGuitarWave(ctx) {
-  const harmonics = [0, 1, 0.5, 0.25, 0.12, 0.06, 0.03, 0.015];
+  const harmonics = [0, 1.0, 0.55, 0.40, 0.20, 0.14, 0.09, 0.05, 0.03, 0.02];
   const real = new Float32Array(harmonics.length);
   const imag = new Float32Array(harmonics.length);
-  real.set(harmonics);
+  imag.set(harmonics);   // sine-phase harmonics
   return ctx.createPeriodicWave(real, imag, { disableNormalization: false });
+}
+
+// Short filtered-noise "pick" transient — the single strongest cue that a note
+// was plucked (string/pick contact) rather than struck like a piano key.
+function playPickNoise(ctx, dest, freq, startT, level) {
+  const N = Math.max(1, Math.floor(ctx.sampleRate * 0.012));
+  const buf = ctx.createBuffer(1, N, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < N; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / N);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const bp = ctx.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = Math.min(freq * 3, 3500);
+  bp.Q.value = 0.7;
+  const g = ctx.createGain();
+  g.gain.value = level;
+  src.connect(bp); bp.connect(g); g.connect(dest);
+  src.start(startT); src.stop(startT + 0.02);
+  playNodes.push(src);
 }
 
 playBtn.addEventListener("click", startPlayback);
@@ -280,38 +316,48 @@ function startPlayback() {
   stopPlayback();
 
   audioCtx = audioCtx || new AudioContext();
+  if (audioCtx.state === "suspended") audioCtx.resume();
 
   // ── Timing normalisation ───────────────────────────────────────────────
-  // Shift all timings so the first detected note plays immediately at t=0.
-  // Without this, if the guitar enters at 5 s in the track, playback begins
-  // with 5 s of silence and then rushes — making speed feel wrong.
   const offset = tabTimings.length > 0 ? tabTimings[0] : 0;
   normTimings = tabTimings.map(t => t - offset);
 
   const lastNorm = normTimings.length > 0 ? normTimings[normTimings.length - 1] : tabColumns.length * 0.12;
-  playDuration = lastNorm + 1.2;
+  playDuration = lastNorm + 1.5;
 
   const now = audioCtx.currentTime + 0.05;
   playStart = now;
   playNodes = [];
 
-  // ── Shared compressor ─────────────────────────────────────────────────
+  // ── Master bus: gentle compressor → soft limiter → output ───────────────
+  // Conservative settings so it tames peaks without ducking to silence.
   const comp = audioCtx.createDynamicsCompressor();
-  comp.threshold.setValueAtTime(-20, now);
-  comp.knee.setValueAtTime(10, now);
-  comp.ratio.setValueAtTime(6, now);
-  comp.attack.setValueAtTime(0.003, now);
-  comp.release.setValueAtTime(0.12, now);
-  comp.connect(audioCtx.destination);
+  comp.threshold.setValueAtTime(-12, now);
+  comp.knee.setValueAtTime(18, now);
+  comp.ratio.setValueAtTime(4, now);
+  comp.attack.setValueAtTime(0.004, now);
+  comp.release.setValueAtTime(0.18, now);
+
+  const master = audioCtx.createGain();
+  master.gain.value = hasOverdrive ? 0.55 : 0.75;
+
+  const limiter = audioCtx.createWaveShaper();
+  limiter.curve = makeLimiterCurve();
+
+  master.connect(comp);
+  comp.connect(limiter);
+  limiter.connect(audioCtx.destination);
 
   const guitarWave = hasOverdrive ? null : getGuitarWave(audioCtx);
 
   tabColumns.forEach((col, i) => {
     const colT = now + normTimings[i];
+    const nextT = i + 1 < normTimings.length ? normTimings[i + 1] : normTimings[i] + 0.6;
+    const noteDur = Math.min(Math.max(nextT - normTimings[i], 0.10), 1.8);
 
-    // Duration = gap to next onset (capped at 1.5 s), used for note decay
-    const nextT = i + 1 < normTimings.length ? normTimings[i + 1] : normTimings[i] + 0.5;
-    const noteDur = Math.min(Math.max(nextT - normTimings[i], 0.08), 1.5);
+    // Count notes in this column so a 6-note chord doesn't sum to clipping.
+    const voices = Object.values(col).filter(f => f !== "-" && !isNaN(parseInt(f, 10))).length || 1;
+    const voiceScale = 1 / Math.sqrt(voices);   // equal-power chord scaling
 
     Object.entries(col).forEach(([str, fret]) => {
       if (fret === "-" || !OPEN_MIDI[str]) return;
@@ -320,49 +366,58 @@ function startPlayback() {
 
       const midi = OPEN_MIDI[str] + fretNum;
       const freq = midiToFreq(midi);
-      const decayEnd = colT + noteDur + 0.15;
+      const decayEnd = colT + noteDur + 0.25;
 
-      const osc    = audioCtx.createOscillator();
+      const osc     = audioCtx.createOscillator();
       const envGain = audioCtx.createGain();
       const filter  = audioCtx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.Q.value = 0.7;
 
       osc.frequency.value = freq;
 
       if (hasOverdrive) {
-        // Sawtooth → heavy clip → narrow bandpass (amp cabinet sim)
+        // Sawtooth → MODERATE soft-clip → lowpass cabinet sim.
+        // Lowpass (not bandpass@1kHz) lets the low power-chord fundamentals
+        // through, so "Be Quiet and Drive"-style low chords are audible.
         osc.type = "sawtooth";
         const dist = audioCtx.createWaveShaper();
-        dist.curve = makeDistortionCurve(400);
+        dist.curve = makeDistortionCurve(30);
         dist.oversample = "4x";
 
-        filter.type = "bandpass";
-        filter.frequency.value = 1000;
-        filter.Q.value = 0.6;
+        // Brightness eases down over the note (palm-mute-ish decay)
+        filter.frequency.setValueAtTime(3800, colT);
+        filter.frequency.exponentialRampToValueAtTime(1500, decayEnd);
 
-        envGain.gain.setValueAtTime(0,    colT);
-        envGain.gain.linearRampToValueAtTime(0.20, colT + 0.004);
-        envGain.gain.setValueAtTime(       0.20, colT + 0.004);
-        envGain.gain.exponentialRampToValueAtTime(0.001, decayEnd);
+        const peak = 0.16 * voiceScale;
+        envGain.gain.setValueAtTime(0.0001, colT);
+        envGain.gain.linearRampToValueAtTime(peak, colT + 0.006);
+        envGain.gain.exponentialRampToValueAtTime(peak * 0.5, colT + 0.30);
+        envGain.gain.exponentialRampToValueAtTime(0.0008, decayEnd);
 
         osc.connect(dist);
         dist.connect(filter);
+        playPickNoise(audioCtx, master, freq, colT, 0.05 * voiceScale);
       } else {
-        // Guitar-harmonic PeriodicWave → lowpass (body resonance)
+        // Guitar PeriodicWave → lowpass that SWEEPS DOWN = string damping.
+        // The downward brightness sweep is what makes it read as a plucked
+        // guitar instead of a sustained piano/organ tone.
         osc.setPeriodicWave(guitarWave);
-        filter.type = "lowpass";
-        filter.frequency.value = 2800;
-        filter.Q.value = 0.5;
+        filter.frequency.setValueAtTime(6500, colT);
+        filter.frequency.exponentialRampToValueAtTime(700, decayEnd);
 
-        envGain.gain.setValueAtTime(0,    colT);
-        envGain.gain.linearRampToValueAtTime(0.22, colT + 0.006);  // pluck attack
-        envGain.gain.exponentialRampToValueAtTime(0.06, colT + 0.12);
-        envGain.gain.exponentialRampToValueAtTime(0.001, decayEnd);
+        const peak = 0.30 * voiceScale;
+        envGain.gain.setValueAtTime(0.0001, colT);
+        envGain.gain.linearRampToValueAtTime(peak, colT + 0.005);   // pluck
+        envGain.gain.exponentialRampToValueAtTime(peak * 0.35, colT + 0.18);
+        envGain.gain.exponentialRampToValueAtTime(0.0006, decayEnd);
 
         osc.connect(filter);
+        playPickNoise(audioCtx, master, freq, colT, 0.06 * voiceScale);
       }
 
       filter.connect(envGain);
-      envGain.connect(comp);
+      envGain.connect(master);
 
       osc.start(colT);
       osc.stop(decayEnd + 0.05);
