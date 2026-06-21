@@ -203,9 +203,11 @@ def process_audio(job_id, src: Path):
         set_job(job_id, status="running", progress=58, message="Analysing amp tone…")
         overdrive_info = detect_overdrive(guitar_wav)
 
-        # 5) Transcribe notes
+        # 5) Transcribe notes — distorted audio needs a more sensitive,
+        #    fizz-stripped pass or it detects almost nothing.
         set_job(job_id, status="running", progress=65, message="Transcribing notes…")
-        notes = run_basic_pitch(job_id, guitar_wav)
+        notes = run_basic_pitch(job_id, guitar_wav,
+                                distorted=bool(overdrive_info.get("detected")))
 
         # 6) Build tab
         set_job(job_id, status="running", progress=85, message="Building guitar tab…")
@@ -411,14 +413,50 @@ def detect_tuning(wav_path: Path):
     return best[0], best[1]
 
 
-def transcribe_notes(job_id, wav_path: Path):
+def _preprocess_for_distortion(wav_path: Path) -> Path:
+    """Tame distorted-guitar fizz so Basic Pitch can find the fundamentals.
+
+    Heavy distortion smears energy into a wall of high-frequency harmonics
+    that buries the note fundamentals Basic Pitch keys on. We low-pass at
+    ~5 kHz (kills fizz, keeps the notes), pull the harmonic component out with
+    HPSS (removes pick/percussive transients that look like phantom onsets),
+    and normalise. Returns a temp wav path, or the original on any failure.
+    """
+    import librosa
+    import numpy as np
+    import soundfile as sf
+    try:
+        y, sr = librosa.load(str(wav_path), mono=True, duration=90.0)
+        if len(y) == 0:
+            return wav_path
+        # Keep the harmonic (tonal) part; discard percussive fizz/noise.
+        y_harm = librosa.effects.harmonic(y, margin=2.0)
+        # Low-pass ~5 kHz via STFT magnitude masking (cheap, no SciPy filter design)
+        D = librosa.stft(y_harm, n_fft=2048)
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        D[freqs > 5000, :] *= 0.15
+        y_lp = librosa.istft(D)
+        peak = float(np.max(np.abs(y_lp))) or 1.0
+        y_lp = (y_lp / peak) * 0.97
+        out = wav_path.with_name(wav_path.stem + "_distprep.wav")
+        sf.write(str(out), y_lp, sr)
+        return out
+    except Exception:
+        return wav_path
+
+
+def transcribe_notes(job_id, wav_path: Path, distorted: bool = False):
     """Polyphonic guitar transcription with Spotify's Basic Pitch (ONNX backend).
 
     Basic Pitch is a CNN trained on real polyphonic recordings (including
     GuitarSet — acoustic guitar). It outputs note events with pitch, start,
     end and amplitude, and natively detects CHORDS (multiple simultaneous
-    notes), unlike a monophonic tracker. We then filter spurious notes by
-    amplitude and clamp to the guitar range.
+    notes), unlike a monophonic tracker.
+
+    `distorted=True` (set when overdrive is detected) switches to a more
+    sensitive configuration AND pre-processes the audio to strip distortion
+    fizz, because the clean-tuned thresholds detect almost nothing on heavily
+    overdriven guitar (that was the "overdrive song is silent — no notes" bug).
     """
     import warnings, logging
     warnings.filterwarnings("ignore")
@@ -427,15 +465,20 @@ def transcribe_notes(job_id, wav_path: Path):
     from basic_pitch.inference import predict
     from basic_pitch import ICASSP_2022_MODEL_PATH
 
-    # onset/frame thresholds tuned for guitar:
-    #  - lower onset_threshold catches soft fingerpicked notes
-    #  - minimum_note_length filters sub-90ms blips (string noise, artifacts)
+    audio_path = _preprocess_for_distortion(wav_path) if distorted else wav_path
+
+    if distorted:
+        # More sensitive: catch buried fundamentals & fast riffs in distortion.
+        onset_th, frame_th, min_len, amp_factor = 0.30, 0.22, 70, 0.10
+    else:
+        onset_th, frame_th, min_len, amp_factor = 0.45, 0.30, 90, 0.18
+
     _, _, note_events = predict(
-        str(wav_path),
+        str(audio_path),
         ICASSP_2022_MODEL_PATH,
-        onset_threshold=0.45,
-        frame_threshold=0.30,
-        minimum_note_length=90,        # ms
+        onset_threshold=onset_th,
+        frame_threshold=frame_th,
+        minimum_note_length=min_len,   # ms
         minimum_frequency=73.4,        # D2 — covers Drop D / down-tunings
         maximum_frequency=1318.5,      # E6 — high frets on the high E string
         multiple_pitch_bends=False,
@@ -446,10 +489,10 @@ def transcribe_notes(job_id, wav_path: Path):
         return []
 
     # Amplitude-based spurious-note filter: keep notes whose confidence is at
-    # least 18% of the loudest note. Removes the scattered "random notes" that
-    # come from bleed/reverb without dropping genuine quiet chord tones.
+    # least amp_factor× the loudest note. Lower factor for distortion so quiet
+    # buried chord tones survive.
     amps = [float(ev[3]) for ev in note_events if len(ev) > 3]
-    amp_floor = (max(amps) * 0.18) if amps else 0.0
+    amp_floor = (max(amps) * amp_factor) if amps else 0.0
 
     notes = []
     for ev in note_events:
@@ -475,8 +518,8 @@ def transcribe_notes(job_id, wav_path: Path):
 
 
 # Backwards-compatible alias (process_audio still calls run_basic_pitch)
-def run_basic_pitch(job_id, wav_path: Path):
-    return transcribe_notes(job_id, wav_path)
+def run_basic_pitch(job_id, wav_path: Path, distorted: bool = False):
+    return transcribe_notes(job_id, wav_path, distorted)
 
 
 def build_tab(notes, open_strings, tuning_name):

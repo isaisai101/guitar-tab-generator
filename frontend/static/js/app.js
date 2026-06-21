@@ -350,78 +350,77 @@ function startPlayback() {
 
   const guitarWave = hasOverdrive ? null : getGuitarWave(audioCtx);
 
+  // Strings low → high pitch, so a chord is STRUMMED (low strings a few ms
+  // before the high strings) instead of all notes hitting at once as a block.
+  const STRING_ORDER = ["E", "A", "D", "G", "B", "e"];
+  const STRUM = 0.022;   // seconds between adjacent strings within a strum
+
+  // Schedule one voice. Callers wrap this in try/catch so a single bad note
+  // can never abort the loop and silence the whole song.
+  function voiceNote(freq, startT, noteDur, voiceScale) {
+    const decayEnd = startT + noteDur + 0.25;
+    const osc     = audioCtx.createOscillator();
+    const envGain = audioCtx.createGain();
+    const filter  = audioCtx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.Q.value = 0.7;
+    osc.frequency.value = freq;
+
+    if (hasOverdrive) {
+      // Sawtooth → moderate soft-clip → lowpass cabinet (passes low chords).
+      osc.type = "sawtooth";
+      const dist = audioCtx.createWaveShaper();
+      dist.curve = makeDistortionCurve(30);
+      dist.oversample = "4x";
+      filter.frequency.setValueAtTime(3800, startT);
+      filter.frequency.exponentialRampToValueAtTime(1500, decayEnd);
+      const peak = 0.24 * voiceScale;
+      envGain.gain.setValueAtTime(0.0001, startT);
+      envGain.gain.linearRampToValueAtTime(peak, startT + 0.006);
+      envGain.gain.exponentialRampToValueAtTime(peak * 0.6, startT + 0.30);
+      envGain.gain.exponentialRampToValueAtTime(0.0008, decayEnd);
+      osc.connect(dist); dist.connect(filter);
+      playPickNoise(audioCtx, master, freq, startT, 0.05 * voiceScale);
+    } else {
+      // Guitar wave → lowpass that SWEEPS DOWN = string damping (plucked feel).
+      osc.setPeriodicWave(guitarWave);
+      filter.frequency.setValueAtTime(6500, startT);
+      filter.frequency.exponentialRampToValueAtTime(700, decayEnd);
+      const peak = 0.30 * voiceScale;
+      envGain.gain.setValueAtTime(0.0001, startT);
+      envGain.gain.linearRampToValueAtTime(peak, startT + 0.005);   // pluck
+      envGain.gain.exponentialRampToValueAtTime(peak * 0.35, startT + 0.18);
+      envGain.gain.exponentialRampToValueAtTime(0.0006, decayEnd);
+      osc.connect(filter);
+      playPickNoise(audioCtx, master, freq, startT, 0.06 * voiceScale);
+    }
+
+    filter.connect(envGain);
+    envGain.connect(master);
+    osc.start(startT);
+    osc.stop(decayEnd + 0.05);
+    playNodes.push(osc);
+  }
+
   tabColumns.forEach((col, i) => {
     const colT = now + normTimings[i];
     const nextT = i + 1 < normTimings.length ? normTimings[i + 1] : normTimings[i] + 0.6;
     const noteDur = Math.min(Math.max(nextT - normTimings[i], 0.10), 1.8);
 
-    // Count notes in this column so a 6-note chord doesn't sum to clipping.
-    const voices = Object.values(col).filter(f => f !== "-" && !isNaN(parseInt(f, 10))).length || 1;
+    // Notes in this column, ordered low → high string for strumming.
+    const colMidis = STRING_ORDER
+      .filter(s => col[s] !== undefined && col[s] !== "-" && !isNaN(parseInt(col[s], 10)))
+      .map(s => OPEN_MIDI[s] + parseInt(col[s], 10));
+
+    const voices = colMidis.length || 1;
     const voiceScale = 1 / Math.sqrt(voices);   // equal-power chord scaling
+    const isChord = voices >= 2;
 
-    Object.entries(col).forEach(([str, fret]) => {
-      if (fret === "-" || !OPEN_MIDI[str]) return;
-      const fretNum = parseInt(fret, 10);
-      if (isNaN(fretNum)) return;
-
-      const midi = OPEN_MIDI[str] + fretNum;
-      const freq = midiToFreq(midi);
-      const decayEnd = colT + noteDur + 0.25;
-
-      const osc     = audioCtx.createOscillator();
-      const envGain = audioCtx.createGain();
-      const filter  = audioCtx.createBiquadFilter();
-      filter.type = "lowpass";
-      filter.Q.value = 0.7;
-
-      osc.frequency.value = freq;
-
-      if (hasOverdrive) {
-        // Sawtooth → MODERATE soft-clip → lowpass cabinet sim.
-        // Lowpass (not bandpass@1kHz) lets the low power-chord fundamentals
-        // through, so "Be Quiet and Drive"-style low chords are audible.
-        osc.type = "sawtooth";
-        const dist = audioCtx.createWaveShaper();
-        dist.curve = makeDistortionCurve(30);
-        dist.oversample = "4x";
-
-        // Brightness eases down over the note (palm-mute-ish decay)
-        filter.frequency.setValueAtTime(3800, colT);
-        filter.frequency.exponentialRampToValueAtTime(1500, decayEnd);
-
-        const peak = 0.16 * voiceScale;
-        envGain.gain.setValueAtTime(0.0001, colT);
-        envGain.gain.linearRampToValueAtTime(peak, colT + 0.006);
-        envGain.gain.exponentialRampToValueAtTime(peak * 0.5, colT + 0.30);
-        envGain.gain.exponentialRampToValueAtTime(0.0008, decayEnd);
-
-        osc.connect(dist);
-        dist.connect(filter);
-        playPickNoise(audioCtx, master, freq, colT, 0.05 * voiceScale);
-      } else {
-        // Guitar PeriodicWave → lowpass that SWEEPS DOWN = string damping.
-        // The downward brightness sweep is what makes it read as a plucked
-        // guitar instead of a sustained piano/organ tone.
-        osc.setPeriodicWave(guitarWave);
-        filter.frequency.setValueAtTime(6500, colT);
-        filter.frequency.exponentialRampToValueAtTime(700, decayEnd);
-
-        const peak = 0.30 * voiceScale;
-        envGain.gain.setValueAtTime(0.0001, colT);
-        envGain.gain.linearRampToValueAtTime(peak, colT + 0.005);   // pluck
-        envGain.gain.exponentialRampToValueAtTime(peak * 0.35, colT + 0.18);
-        envGain.gain.exponentialRampToValueAtTime(0.0006, decayEnd);
-
-        osc.connect(filter);
-        playPickNoise(audioCtx, master, freq, colT, 0.06 * voiceScale);
-      }
-
-      filter.connect(envGain);
-      envGain.connect(master);
-
-      osc.start(colT);
-      osc.stop(decayEnd + 0.05);
-      playNodes.push(osc);
+    colMidis.forEach((midi, ni) => {
+      const startT = colT + (isChord ? ni * STRUM : 0);
+      try {
+        voiceNote(midiToFreq(midi), startT, noteDur, voiceScale);
+      } catch (e) { /* skip one bad note; keep the rest playing */ }
     });
   });
 
